@@ -234,52 +234,47 @@ def _pick_solver():
 
 def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int):
     """
-    DA:
-      - agent gets fixed share S_i(t)=S(t)/n
-      - chooses w_i(t) and forward transfers z_{t,t'} (t < t') to maximize beta
-      - constraints:
-          beta * d(t) <= w(t)   (for d(t)>0)
-          Sprime(t) = S(t)/n - outgoing + incoming
-          w(t) <= Sprime(t)
+    DA via inventory/stock formulation (forward storage only).
+    Guarantees feasibility: cannot allocate more than S(t)/n plus carried stock.
     """
     d = single_agent_d.reshape(-1).astype(float)
     if len(d) != T:
         raise ValueError("single_agent_d has wrong length.")
     S = S.astype(float)
 
+    Si = S / n  # per-agent share
+
     prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
 
     w = pulp.LpVariable.dicts("w", list(range(T)), lowBound=0)
-    Sprime = pulp.LpVariable.dicts("Sprime", list(range(T)), lowBound=0)
+    y = pulp.LpVariable.dicts("y", list(range(T)), lowBound=0)  # stock carried to next time
     beta = pulp.LpVariable("beta", lowBound=1e-9, upBound=1.0)
-
-    z = {}
-    for t in range(T):
-        for tp in range(t + 1, T):
-            z[(t, tp)] = pulp.LpVariable(f"z_{t}_{tp}", lowBound=0)
 
     prob += beta
 
-    for t in range(T):
-        incoming = pulp.lpSum(z[(tp, t)] for tp in range(0, t) if (tp, t) in z)
-        outgoing = pulp.lpSum(z[(t, tp)] for tp in range(t + 1, T) if (t, tp) in z)
-        prob += (Sprime[t] == (S[t] / n) - outgoing + incoming), f"Sprime_balance_{t}"
+    # Inventory constraints
+    # t = 0
+    prob += (w[0] + y[0] <= Si[0]), "inv_0"
 
+    # 1..T-2
+    for t in range(1, T):
+        prob += (w[t] + y[t] <= Si[t] + y[t-1]), f"inv_{t}"
+
+    # Satisfaction constraints (skip zero demand entries)
     for t in range(T):
-        prob += (w[t] <= Sprime[t]), f"w_le_Sprime_{t}"
         if d[t] > 0:
             prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
 
-    solver = _pick_solver()
+    solver = pulp.PULP_CBC_CMD(msg=False)
     status = prob.solve(solver)
 
     if pulp.LpStatus[status] != "Optimal":
         return np.zeros(T), 0.0, np.zeros(T)
 
     w_arr = np.array([pulp.value(w[t]) for t in range(T)], dtype=float)
-    Sprime_arr = np.array([pulp.value(Sprime[t]) for t in range(T)], dtype=float)
+    y_arr = np.array([pulp.value(y[t]) for t in range(T)], dtype=float)
     beta_val = float(pulp.value(beta))
-    return w_arr, beta_val, Sprime_arr
+    return w_arr, beta_val, y_arr
 
 
 def leontief_alpha(alloc: np.ndarray, demand: np.ndarray) -> float:
@@ -446,3 +441,4 @@ if run:
 
     except Exception as e:
         st.error(str(e))
+
