@@ -284,7 +284,7 @@ def to_excel_bytes(**dfs: pd.DataFrame) -> bytes:
 # ============================
 
 st.set_page_config(page_title="SE / SEIR / DA Allocator", layout="wide")
-st.title("SE / SEIR / DA — Streamlit (License-free LP, Infinite Storage)")
+st.title("SE / SEIR / DA (Infinite Storage)")
 
 with st.expander("Input format (quick)", expanded=False):
     st.write(
@@ -410,3 +410,4 @@ if run:
 
     except Exception as e:
         st.error(str(e))
+
