@@ -3,19 +3,25 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.so
+*.egg-info/
+dist/
+build/
 
-# Streamlit
-.streamlit/
+# Jupyter / notebooks
+.ipynb_checkpoints/
 
-# OS
+# OS / IDE
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-
-# Excel temporary files
-~$*.xlsx
-
-# VS Code
 .vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data / outputs
+*.xlsx
+*.csv
+*.log
+*.tmp
