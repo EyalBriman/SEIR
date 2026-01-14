@@ -277,6 +277,7 @@ def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: i
     return w_arr, beta_val, y_arr
 
 
+
 def leontief_alpha(alloc: np.ndarray, demand: np.ndarray) -> float:
     mask = demand > 0
     if not np.any(mask):
@@ -441,4 +442,5 @@ if run:
 
     except Exception as e:
         st.error(str(e))
+
 
