@@ -4,9 +4,18 @@
 #   (2) DA (Decentralized): each agent gets S(t)/n and optimizes beta_i with forward storage transfers
 #   (3) SEIR = DA allocations + SE on residual supply
 #
-# Run locally:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# Deployment (Streamlit Cloud):
+# - Keep requirements.txt minimal (streamlit, pandas, numpy, openpyxl, pulp)
+# - Use CBC solver via PuLP (no HiGHS) to avoid "cannot execute highs".
+#
+# Notes:
+# - Infinite storage via forward transfers z_{t,t'} (t < t').
+# - Returns allocations for each agent at each time step for all rules.
+# - Validations:
+#     * all entries are >= 0
+#     * each demand row sums to the same value (within tolerance), else error
+#     * supply length matches T
+#     * warn if total supply < total demand
 
 from __future__ import annotations
 
@@ -97,6 +106,12 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
     if len(supply) != T:
         raise ValueError(f"Supply length ({len(supply)}) must match number of time steps in demands ({T}).")
 
+    # Finite checks (helps catch blanks/NaNs from Excel)
+    if not np.isfinite(demands).all():
+        raise ValueError("Demands contain non-numeric or infinite values.")
+    if not np.isfinite(supply).all():
+        raise ValueError("Supply contains non-numeric or infinite values.")
+
     if np.any(demands < 0):
         raise ValueError("Demands must be >= 0 everywhere.")
     if np.any(supply < 0):
@@ -112,6 +127,12 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
             f"All demand rows must have the same sum. "
             f"Got min={np.min(row_sums):.6g}, max={np.max(row_sums):.6g}."
         )
+
+    # Guard against prefixes with zero cumulative supply but positive cumulative demand (SE would get inf)
+    cumD = np.cumsum(demands.sum(axis=0))
+    cumS = np.cumsum(supply)
+    if np.any((cumS == 0) & (cumD > 0)):
+        raise ValueError("Some prefix has zero cumulative supply but positive cumulative demand.")
 
     return n, T
 
@@ -185,34 +206,25 @@ def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
 
 
 # ============================
-# DA (Decentralized) via PuLP
+# DA (Decentralized) via PuLP (CBC only)
 # ============================
 
 def _pick_solver():
     """
-    Prefer HiGHS if available (great for Streamlit Cloud via highspy),
-    otherwise fall back to CBC if present.
+    Use CBC (avoid HiGHS to prevent 'PuLP: cannot execute highs').
     """
-    # HiGHS (recommended)
-    if hasattr(pulp, "HiGHS_CMD"):
-        return pulp.HiGHS_CMD(msg=False)
-    if hasattr(pulp, "HiGHS"):
-        return pulp.HiGHS(msg=False)
-
-    # CBC fallback
     return pulp.PULP_CBC_CMD(msg=False)
 
 
 def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int):
     """
-    DA per Definition 8 in the PDF:
+    DA:
       - agent gets fixed share S_i(t)=S(t)/n
       - chooses w_i(t) and forward transfers z_{t,t'} (t < t') to maximize beta_i
       - constraints:
           beta_i * d_i(t) <= w_i(t)
           S'_i(t) = S_i(t) - sum_{t'>t} z_{t,t'} + sum_{t'<t} z_{t',t}
           w_i(t) <= S'_i(t)
-    (The 1_{t<T} term is automatic because when t is last step there is no t'>t.)
     """
     d = single_agent_d.reshape(-1).astype(float)
     if len(d) != T:
@@ -410,4 +422,3 @@ if run:
 
     except Exception as e:
         st.error(str(e))
-
