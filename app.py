@@ -1,27 +1,16 @@
 # app.py
 # Streamlit UI for:
 #   (1) SE (Sequential Equalizing)
-#   (2) Decentralized Strong-IR (each agent gets 1/n share; infinite storage; license-free LP via PuLP+CBC)
-#   (3) SEIR = Strong-IR allocations + SE on residual supply (your SEIR routine)
+#   (2) DA (Decentralized): each agent gets S(t)/n and optimizes beta_i with forward storage transfers
+#   (3) SEIR = DA allocations + SE on residual supply
 #
-# Run:
-#   pip install streamlit pandas numpy openpyxl pulp
+# Run locally:
+#   pip install -r requirements.txt
 #   streamlit run app.py
-#
-# Notes:
-# - This replaces Gurobi with PuLP (CBC solver bundled via PuLP in many installs; otherwise install coin-or-cbc).
-# - Infinite storage uses your original z[t,t'] transfer formulation.
-# - Returns allocations for each agent at each time step for all rules.
-# - Validations:
-#     * all entries are >= 0
-#     * each demand row sums to the same value (within tolerance), else error
-#     * supply length matches T
-#     * (recommended) total supply >= total demand, else warning (can still run)
 
 from __future__ import annotations
 
 import io
-import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -128,14 +117,14 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
 
 
 # ============================
-# Core algorithms (yours)
+# Core algorithms
 # ============================
 
 def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
     """
-    Your SE (as given).
+    SE (as in your pseudocode).
     demands: (n,T), supplies: (T,)
-    Returns allocations (n,T) and alpha_values list
+    Returns allocations (n,T) and alpha_values list.
     """
     n, T = demands.shape
     allocations = np.zeros((n, T))
@@ -154,29 +143,35 @@ def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
         alpha_values.append(alpha)
 
         for i in (N - N_star):
-            for t in range(t_star+1, T):
+            for t in range(t_star + 1, T):
                 allocations[i, t] += alpha * demands[i, t]
+
             if np.any(demands[i, :t_star+1] > 0):
-                for t in range(t_star+1):
+                for t in range(t_star + 1):
                     allocations[i, t] = alpha * demands[i, t]
                 N_star.add(i)
 
-        # Safety for degenerate cases
+        # safety
         if len(alpha_values) > n + T + 5:
             break
 
     return allocations, alpha_values
 
 
-def seir(demands: np.ndarray, supply: np.ndarray, ir_allocations: np.ndarray):
+def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
     """
-    Your SEIR as given.
+    SEIR:
+      1) start with DA allocations (paper calls this "minimal IR allocation" via DA),
+      2) compute residual supply and push any negative residual backward,
+      3) run SE on residual, and add.
     """
     n, T = demands.shape
-    w_ir = ir_allocations.copy()
+    w_da = da_allocations.copy()
 
-    S_res = supply - np.sum(w_ir, axis=0)
+    # residual
+    S_res = supply - np.sum(w_da, axis=0)
 
+    # push negative residual backward
     for t in range(T - 1, 0, -1):
         if S_res[t] < 0:
             S_res[t - 1] += S_res[t]
@@ -184,83 +179,84 @@ def seir(demands: np.ndarray, supply: np.ndarray, ir_allocations: np.ndarray):
 
     S_res = np.maximum(S_res, 0.0)
 
+    # SE on residual
     w_se, _ = sequential_equalizing(demands, S_res)
-    return w_ir + w_se
+    return w_da + w_se
 
 
 # ============================
-# Strong-IR via PuLP (CBC)
+# DA (Decentralized) via PuLP
 # ============================
 
-def strong_ir_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int):
+def _pick_solver():
     """
-    License-free replacement of your Gurobi Strong-IR LP using PuLP.
+    Prefer HiGHS if available (great for Streamlit Cloud via highspy),
+    otherwise fall back to CBC if present.
+    """
+    # HiGHS (recommended)
+    if hasattr(pulp, "HiGHS_CMD"):
+        return pulp.HiGHS_CMD(msg=False)
+    if hasattr(pulp, "HiGHS"):
+        return pulp.HiGHS(msg=False)
 
-    Matches your original (infinite storage) structure:
-      Variables:
-        w[t] >= 0
-        z[t, t'] >= 0   (transfer from t to t')
-        sigma in [1e-5, 1]
-        X[t] >= 0
-      Constraints:
-        X[t] = S[t]/n + sum_{t'<t} z[t', t] - sum_{t'>t} z[t, t']
-        w[t] <= X[t]
-        sigma * d[t] <= w[t]
-        sum_t X[t] = sum_t S[t]/n  (redundant but we keep it to match)
-    Objective:
-        maximize sigma
+    # CBC fallback
+    return pulp.PULP_CBC_CMD(msg=False)
+
+
+def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int):
+    """
+    DA per Definition 8 in the PDF:
+      - agent gets fixed share S_i(t)=S(t)/n
+      - chooses w_i(t) and forward transfers z_{t,t'} (t < t') to maximize beta_i
+      - constraints:
+          beta_i * d_i(t) <= w_i(t)
+          S'_i(t) = S_i(t) - sum_{t'>t} z_{t,t'} + sum_{t'<t} z_{t',t}
+          w_i(t) <= S'_i(t)
+    (The 1_{t<T} term is automatic because when t is last step there is no t'>t.)
     """
     d = single_agent_d.reshape(-1).astype(float)
     if len(d) != T:
         raise ValueError("single_agent_d has wrong length.")
     S = S.astype(float)
 
-    prob = pulp.LpProblem("Strong_IR", pulp.LpMaximize)
+    prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
 
     # Variables
     w = pulp.LpVariable.dicts("w", list(range(T)), lowBound=0)
-    X = pulp.LpVariable.dicts("X", list(range(T)), lowBound=0)
-    sigma = pulp.LpVariable("sigma", lowBound=1e-5, upBound=1.0)
+    Sprime = pulp.LpVariable.dicts("Sprime", list(range(T)), lowBound=0)
+    beta = pulp.LpVariable("beta", lowBound=1e-9, upBound=1.0)
 
-    # Only need z for t < t' (transfers forward); storing from future to past makes no sense here.
-    # BUT your original uses full z[t, t'] and the balance equation uses both directions.
-    # We'll keep full matrix z[t, t'] >= 0 for fidelity.
+    # Only allow forward transfers z_{t,t'} for t < t'
     z = {}
     for t in range(T):
-        for tp in range(T):
+        for tp in range(t + 1, T):
             z[(t, tp)] = pulp.LpVariable(f"z_{t}_{tp}", lowBound=0)
 
     # Objective
-    prob += sigma
+    prob += beta
 
-    # Effective supply constraints
+    # Sprime balance (S_i(t)=S(t)/n)
     for t in range(T):
-        incoming = pulp.lpSum(z[(tp, t)] for tp in range(t))
-        outgoing = pulp.lpSum(z[(t, tp)] for tp in range(t + 1, T))
-        prob += (X[t] == (S[t] / n) + incoming - outgoing), f"effective_supply_{t}"
+        incoming = pulp.lpSum(z[(tp, t)] for tp in range(0, t) if (tp, t) in z)
+        outgoing = pulp.lpSum(z[(t, tp)] for tp in range(t + 1, T) if (t, tp) in z)
+        prob += (Sprime[t] == (S[t] / n) - outgoing + incoming), f"Sprime_balance_{t}"
 
-    # Allocation <= effective supply
+    # Feasibility and tight allocation constraints
     for t in range(T):
-        prob += (w[t] <= X[t]), f"supply_constraint_{t}"
-
-    # sigma feasibility
-    for t in range(T):
-        prob += (sigma * d[t] <= w[t]), f"sigma_constraint_{t}"
-
-    # Total supply conservation (matches your original)
-    prob += (pulp.lpSum(X[t] for t in range(T)) == pulp.lpSum((S[t] / n) for t in range(T))), "supply_conservation"
+        prob += (w[t] <= Sprime[t]), f"w_le_Sprime_{t}"
+        prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
 
     # Solve
-    # CBC is the default open-source solver for PuLP in many environments.
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    solver = _pick_solver()
+    status = prob.solve(solver)
 
     if pulp.LpStatus[status] != "Optimal":
         return np.zeros(T), 0.0, np.zeros(T)
 
     w_arr = np.array([pulp.value(w[t]) for t in range(T)], dtype=float)
-    X_arr = np.array([pulp.value(X[t]) for t in range(T)], dtype=float)
-    sig = float(pulp.value(sigma))
-    return w_arr, sig, X_arr
+    Sprime_arr = np.array([pulp.value(Sprime[t]) for t in range(T)], dtype=float)
+    beta_val = float(pulp.value(beta))
+    return w_arr, beta_val, Sprime_arr
 
 
 def leontief_alpha(alloc: np.ndarray, demand: np.ndarray) -> float:
@@ -287,8 +283,8 @@ def to_excel_bytes(**dfs: pd.DataFrame) -> bytes:
 # Streamlit UI
 # ============================
 
-st.set_page_config(page_title="SE / SEIR Allocator (No Gurobi)", layout="wide")
-st.title("SE / SEIR / Decentralized Strong-IR — Streamlit (No Gurobi, Infinite Storage)")
+st.set_page_config(page_title="SE / SEIR / DA Allocator", layout="wide")
+st.title("SE / SEIR / DA — Streamlit (License-free LP, Infinite Storage)")
 
 with st.expander("Input format (quick)", expanded=False):
     st.write(
@@ -335,7 +331,6 @@ if run:
 
         n, T = validate_inputs(demands, supply)
 
-        # Helpful warning if supply is tight (not a hard error)
         total_d = float(np.sum(demands))
         total_s = float(np.sum(supply))
         if total_s + 1e-9 < total_d:
@@ -345,19 +340,20 @@ if run:
             )
 
         # SE
-        alloc_se, se_alpha_list = sequential_equalizing(demands, supply)
+        alloc_se, _ = sequential_equalizing(demands, supply)
 
-        # Decentralized Strong-IR for each agent
-        v = np.zeros_like(demands, dtype=float)
-        alpha_ir = np.zeros(n, dtype=float)
+        # DA for each agent
+        alloc_da = np.zeros_like(demands, dtype=float)
+        beta_da = np.zeros(n, dtype=float)
         for i in range(n):
-            v[i, :], alpha_ir[i], _ = strong_ir_optimization_pulp(demands[i:i+1], supply, T, n)
+            alloc_da[i, :], beta_da[i], _ = da_optimization_pulp(demands[i:i+1], supply, T, n)
 
         # SEIR
-        alloc_seir = seir(demands, supply, v)
+        alloc_seir = seir(demands, supply, alloc_da)
 
         # Per-agent Leontief alphas
         alpha_se = np.array([leontief_alpha(alloc_se[i], demands[i]) for i in range(n)], dtype=float)
+        alpha_da = np.array([leontief_alpha(alloc_da[i], demands[i]) for i in range(n)], dtype=float)
         alpha_seir = np.array([leontief_alpha(alloc_seir[i], demands[i]) for i in range(n)], dtype=float)
 
         st.success("Computed allocations.")
@@ -367,19 +363,20 @@ if run:
         df_dem = pd.DataFrame(demands, index=idx, columns=cols)
         df_sup = pd.DataFrame(supply.reshape(1, -1), index=["supply"], columns=cols)
         df_se = pd.DataFrame(alloc_se, index=idx, columns=cols)
-        df_ir = pd.DataFrame(v, index=idx, columns=cols)
+        df_da = pd.DataFrame(alloc_da, index=idx, columns=cols)
         df_seir = pd.DataFrame(alloc_seir, index=idx, columns=cols)
 
         summary = pd.DataFrame(
             {
                 "alpha_SE": alpha_se,
-                "alpha_StrongIR_decentralized": alpha_ir,
+                "beta_DA": beta_da,          # the LP objective value
+                "alpha_DA": alpha_da,        # computed from final DA allocation
                 "alpha_SEIR": alpha_seir,
             },
             index=idx,
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Summary", "SE", "Decentralized Strong-IR", "SEIR"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Summary", "SE", "DA (Decentralized)", "SEIR"])
 
         with tab1:
             st.write("**Sizes**", {"n": n, "T": T})
@@ -390,7 +387,7 @@ if run:
             st.dataframe(df_se, use_container_width=True)
 
         with tab3:
-            st.dataframe(df_ir, use_container_width=True)
+            st.dataframe(df_da, use_container_width=True)
 
         with tab4:
             st.dataframe(df_seir, use_container_width=True)
@@ -399,7 +396,7 @@ if run:
             demands=df_dem,
             supply=df_sup,
             SE=df_se,
-            StrongIR_decentralized=df_ir,
+            DA=df_da,
             SEIR=df_seir,
             Summary=summary,
         )
@@ -413,4 +410,3 @@ if run:
 
     except Exception as e:
         st.error(str(e))
-
