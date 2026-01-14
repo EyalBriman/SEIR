@@ -1,23 +1,23 @@
 # app.py
 # Streamlit UI for:
 #   (1) SE (Sequential Equalizing)  [FIXED: alpha = cumulative_supply / cumulative_demand]
-#   (2) DA (Decentralized): each agent gets S(t)/n and optimizes beta_i with forward storage transfers
-#   (3) SEIR = DA allocations + SE on residual supply
+#   (2) DA (Decentralized): each agent gets S(t)/n and can carry unused supply forward (infinite storage)
+#   (3) SEIR = DA allocations + SE on residual supply (with backward push of negative residual)
 #
 # Run locally:
 #   pip install streamlit pandas numpy openpyxl pulp
 #   streamlit run app.py
 #
-# Notes:
-# - No HiGHS (avoids "PuLP: cannot execute highs"). Uses CBC via PuLP.
-# - Infinite storage via forward transfers z_{t,t'} (t < t').
-# - Validations:
-#     * all entries are >= 0
-#     * each demand row sums to the same value (within tolerance), else error
-#     * supply length matches T
-#     * guard against prefix with zero cumulative supply but positive cumulative demand
-# - Sanity checks:
-#     * SE and SEIR must not allocate more than supply at any time step
+# IMPORTANT:
+# - With storage, it is NORMAL that sum_i w_i(t) can exceed S(t) at some t
+#   (it uses stored supply from earlier times). So we check feasibility cumulatively:
+#       for all t: sum_{j<=t} sum_i w_i(j) <= sum_{j<=t} S(j)
+#
+# This version:
+# - avoids HiGHS (prevents "PuLP: cannot execute highs") and uses CBC
+# - validates: nonnegative, numeric, demand row sums equal, supply length matches
+# - checks cumulative feasibility for SE, DA, SEIR
+# - exports all tables to Excel
 
 from __future__ import annotations
 
@@ -38,8 +38,7 @@ def parse_matrix_from_text(text: str) -> np.ndarray:
     # Try CSV first
     try:
         df = pd.read_csv(io.StringIO(text), header=None)
-        arr = df.values.astype(float)
-        return arr
+        return df.values.astype(float)
     except Exception:
         # Fallback whitespace
         rows = [r.strip() for r in text.strip().splitlines() if r.strip()]
@@ -108,7 +107,6 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
     if len(supply) != T:
         raise ValueError(f"Supply length ({len(supply)}) must match number of time steps in demands ({T}).")
 
-    # Finite checks (helps catch blanks/NaNs from Excel)
     if not np.isfinite(demands).all():
         raise ValueError("Demands contain non-numeric or infinite values.")
     if not np.isfinite(supply).all():
@@ -130,13 +128,34 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
             f"Got min={np.min(row_sums):.6g}, max={np.max(row_sums):.6g}."
         )
 
-    # Guard against prefixes with zero cumulative supply but positive cumulative demand
+    # Guard: some prefix has positive demand but zero cumulative supply
     cumD = np.cumsum(demands.sum(axis=0))
     cumS = np.cumsum(supply)
     if np.any((cumS == 0) & (cumD > 0)):
         raise ValueError("Some prefix has zero cumulative supply but positive cumulative demand.")
 
     return n, T
+
+
+# ============================
+# Feasibility checks (WITH STORAGE)
+# ============================
+
+def check_cumulative_feasible(alloc: np.ndarray, supply: np.ndarray, eps: float = 1e-6) -> None:
+    """
+    With storage, per-time feasibility is not required.
+    The correct check is prefix feasibility:
+      for all t: sum_{j<=t} sum_i alloc[i,j] <= sum_{j<=t} supply[j] + eps
+    """
+    used_prefix = np.cumsum(np.sum(alloc, axis=0))
+    supply_prefix = np.cumsum(supply)
+    bad = used_prefix > supply_prefix + eps
+    if np.any(bad):
+        t_bad = int(np.argmax(bad))
+        raise RuntimeError(
+            f"Cumulative infeasible at t={t_bad}: "
+            f"used_prefix={used_prefix[t_bad]:.6g} > supply_prefix={supply_prefix[t_bad]:.6g}."
+        )
 
 
 # ============================
@@ -147,28 +166,20 @@ def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
     """
     Sequential Equalizing (SE) — FIXED.
 
-    Satisfaction alpha should be allocation/demand, so alpha must be <= 1 when supply < demand.
+    Satisfaction alpha is allocation/demand.
     Therefore:
-        alpha(t) = cumulative_supply(1..t) / cumulative_demand(1..t)
-    and we pick:
-        t* = argmin_t alpha(t)
-        alpha = alpha(t*)
-    Then allocate w_i(t) = alpha * d_i(t) for t <= t* for "fixed" agents and
-    add alpha*d_i(t) for t > t* progressively (as in your code).
+      alpha(t) = cumulative_supply(1..t) / cumulative_demand(1..t)
+      t* = argmin_t alpha(t)
+      alpha = alpha(t*)
     """
     n, T = demands.shape
     allocations = np.zeros((n, T))
-    N_star = set()
-    N = set(range(n))
-    alpha_values = []
+    N_star: set[int] = set()
+    N: set[int] = set(range(n))
+    alpha_values: list[float] = []
 
-    # Cumulative totals across all agents
     cumD = np.cumsum(np.sum(demands, axis=0))
     cumS = np.cumsum(supplies)
-
-    # If some prefix has positive demand but zero supply, SE is ill-defined (alpha=0)
-    if np.any((cumS == 0) & (cumD > 0)):
-        raise ValueError("Some prefix has zero cumulative supply but positive cumulative demand.")
 
     while N_star != N:
         Q = [
@@ -205,12 +216,10 @@ def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
       3) push negative residual backward,
       4) run SE on residual and add.
     """
-    n, T = demands.shape
     w_da = da_allocations.copy()
-
     S_res = supply - np.sum(w_da, axis=0)
 
-    for t in range(T - 1, 0, -1):
+    for t in range(len(S_res) - 1, 0, -1):
         if S_res[t] < 0:
             S_res[t - 1] += S_res[t]
             S_res[t] = 0.0
@@ -222,45 +231,40 @@ def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
 
 
 # ============================
-# DA (Decentralized) via PuLP (CBC only)
+# DA via PuLP (CBC) using stock/inventory formulation
 # ============================
-
-def _pick_solver():
-    """
-    Use CBC (avoid HiGHS to prevent 'PuLP: cannot execute highs').
-    """
-    return pulp.PULP_CBC_CMD(msg=False)
-
 
 def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int):
     """
-    DA via inventory/stock formulation (forward storage only).
-    Guarantees feasibility: cannot allocate more than S(t)/n plus carried stock.
+    DA with infinite storage (forward carry):
+      - per-time share Si(t) = S(t)/n
+      - variables: w(t) allocation, y(t) stock carried to next time, beta
+      - constraints:
+          w(0) + y(0) <= Si(0)
+          for t>=1: w(t) + y(t) <= Si(t) + y(t-1)
+          beta*d(t) <= w(t) for d(t)>0
+      - objective: maximize beta
     """
     d = single_agent_d.reshape(-1).astype(float)
     if len(d) != T:
         raise ValueError("single_agent_d has wrong length.")
     S = S.astype(float)
-
-    Si = S / n  # per-agent share
+    Si = S / n
 
     prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
 
     w = pulp.LpVariable.dicts("w", list(range(T)), lowBound=0)
-    y = pulp.LpVariable.dicts("y", list(range(T)), lowBound=0)  # stock carried to next time
+    y = pulp.LpVariable.dicts("y", list(range(T)), lowBound=0)
     beta = pulp.LpVariable("beta", lowBound=1e-9, upBound=1.0)
 
     prob += beta
 
-    # Inventory constraints
-    # t = 0
+    # inventory constraints
     prob += (w[0] + y[0] <= Si[0]), "inv_0"
-
-    # 1..T-2
     for t in range(1, T):
         prob += (w[t] + y[t] <= Si[t] + y[t-1]), f"inv_{t}"
 
-    # Satisfaction constraints (skip zero demand entries)
+    # satisfaction constraints
     for t in range(T):
         if d[t] > 0:
             prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
@@ -275,7 +279,6 @@ def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: i
     y_arr = np.array([pulp.value(y[t]) for t in range(T)], dtype=float)
     beta_val = float(pulp.value(beta))
     return w_arr, beta_val, y_arr
-
 
 
 def leontief_alpha(alloc: np.ndarray, demand: np.ndarray) -> float:
@@ -313,6 +316,7 @@ with st.expander("Input format (quick)", expanded=False):
 - Validation:
   - all numbers must be **>= 0**
   - each demand row must sum to the **same total** (otherwise error)
+- With storage, feasibility is checked **cumulatively** (prefix sums), not per-time.
         """
     )
 
@@ -322,17 +326,17 @@ with col1:
     st.subheader("Demands & Supply")
     mode = st.radio("Input method", ["Paste", "Excel"], horizontal=True)
 
-    demands = None
-    supply = None
-
     if mode == "Paste":
         st.caption("Paste demands: rows=agents, cols=time. Commas or spaces work.")
         d_text = st.text_area("Demands", height=180, placeholder="e.g.\n1 2 3\n1 2 3\n1 2 3")
         st.caption("Paste supply: a single row or column of length T.")
         s_text = st.text_area("Supply", height=120, placeholder="e.g.\n10 10 10")
+        up = None
     else:
         st.caption("Upload .xlsx with sheets 'demands' and 'supply' (or first=demands, second=supply).")
         up = st.file_uploader("Excel file (.xlsx)", type=["xlsx"])
+        d_text = ""
+        s_text = ""
 
 with col2:
     st.subheader("Run")
@@ -360,28 +364,18 @@ if run:
 
         # SE
         alloc_se, _ = sequential_equalizing(demands, supply)
-
-        # Sanity: SE must respect per-time supply
-        if np.any(np.sum(alloc_se, axis=0) > supply + 1e-8):
-            raise RuntimeError("SE infeasible: allocated more than supply at some time step.")
+        check_cumulative_feasible(alloc_se, supply)
 
         # DA for each agent
         alloc_da = np.zeros_like(demands, dtype=float)
         beta_da = np.zeros(n, dtype=float)
         for i in range(n):
             alloc_da[i, :], beta_da[i], _ = da_optimization_pulp(demands[i:i+1], supply, T, n)
-
-        # Sanity: DA cannot exceed total supply per time step (since sum_i S(t)/n = S(t))
-        if np.any(np.sum(alloc_da, axis=0) > supply + 1e-6):
-            # This should not happen mathematically; if it happens, solver outputs are unreliable.
-            raise RuntimeError("DA infeasible: sum of DA allocations exceeds supply at some time step.")
+        check_cumulative_feasible(alloc_da, supply)
 
         # SEIR
         alloc_seir = seir(demands, supply, alloc_da)
-
-        # Sanity: SEIR must respect per-time supply
-        if np.any(np.sum(alloc_seir, axis=0) > supply + 1e-6):
-            raise RuntimeError("SEIR infeasible: allocated more than supply at some time step.")
+        check_cumulative_feasible(alloc_seir, supply)
 
         # Per-agent Leontief alphas
         alpha_se = np.array([leontief_alpha(alloc_se[i], demands[i]) for i in range(n)], dtype=float)
@@ -398,6 +392,15 @@ if run:
         df_da = pd.DataFrame(alloc_da, index=idx, columns=cols)
         df_seir = pd.DataFrame(alloc_seir, index=idx, columns=cols)
 
+        # Helpful diagnostics (not errors) about per-time exceedance due to storage
+        per_time_used_da = np.sum(alloc_da, axis=0)
+        per_time_used_se = np.sum(alloc_se, axis=0)
+        per_time_used_seir = np.sum(alloc_seir, axis=0)
+
+        storage_note = False
+        if np.any(per_time_used_da > supply + 1e-6) or np.any(per_time_used_se > supply + 1e-6) or np.any(per_time_used_seir > supply + 1e-6):
+            storage_note = True
+
         summary = pd.DataFrame(
             {
                 "alpha_SE": alpha_se,
@@ -408,12 +411,17 @@ if run:
             index=idx,
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Summary", "SE", "DA (Decentralized)", "SEIR"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Summary", "SE", "DA (Decentralized)", "SEIR", "Diagnostics"])
 
         with tab1:
             st.write("**Sizes**", {"n": n, "T": T})
             st.write("**Demand row sum (must be identical):**", float(df_dem.sum(axis=1).iloc[0]))
             st.dataframe(summary, use_container_width=True)
+            if storage_note:
+                st.info(
+                    "Note: Some allocations exceed per-time supply S(t). This is allowed with storage "
+                    "(it uses stored supply from earlier time steps). Feasibility is checked cumulatively."
+                )
 
         with tab2:
             st.dataframe(df_se, use_container_width=True)
@@ -424,6 +432,22 @@ if run:
         with tab4:
             st.dataframe(df_seir, use_container_width=True)
 
+        with tab5:
+            diag = pd.DataFrame(
+                {
+                    "S(t)": supply,
+                    "sum_i SE(t)": per_time_used_se,
+                    "sum_i DA(t)": per_time_used_da,
+                    "sum_i SEIR(t)": per_time_used_seir,
+                    "prefix S(<=t)": np.cumsum(supply),
+                    "prefix SE used": np.cumsum(per_time_used_se),
+                    "prefix DA used": np.cumsum(per_time_used_da),
+                    "prefix SEIR used": np.cumsum(per_time_used_seir),
+                },
+                index=cols,
+            )
+            st.dataframe(diag, use_container_width=True)
+
         out_bytes = to_excel_bytes(
             demands=df_dem,
             supply=df_sup,
@@ -431,6 +455,7 @@ if run:
             DA=df_da,
             SEIR=df_seir,
             Summary=summary,
+            Diagnostics=diag,
         )
         st.download_button(
             "Download results (Excel)",
@@ -442,5 +467,3 @@ if run:
 
     except Exception as e:
         st.error(str(e))
-
-
