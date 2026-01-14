@@ -1,21 +1,23 @@
 # app.py
 # Streamlit UI for:
-#   (1) SE (Sequential Equalizing)
+#   (1) SE (Sequential Equalizing)  [FIXED: alpha = cumulative_supply / cumulative_demand]
 #   (2) DA (Decentralized): each agent gets S(t)/n and optimizes beta_i with forward storage transfers
 #   (3) SEIR = DA allocations + SE on residual supply
 #
-# Deployment (Streamlit Cloud):
-# - Keep requirements.txt minimal (streamlit, pandas, numpy, openpyxl, pulp)
-# - Use CBC solver via PuLP (no HiGHS) to avoid "cannot execute highs".
+# Run locally:
+#   pip install streamlit pandas numpy openpyxl pulp
+#   streamlit run app.py
 #
 # Notes:
+# - No HiGHS (avoids "PuLP: cannot execute highs"). Uses CBC via PuLP.
 # - Infinite storage via forward transfers z_{t,t'} (t < t').
-# - Returns allocations for each agent at each time step for all rules.
 # - Validations:
 #     * all entries are >= 0
 #     * each demand row sums to the same value (within tolerance), else error
 #     * supply length matches T
-#     * warn if total supply < total demand
+#     * guard against prefix with zero cumulative supply but positive cumulative demand
+# - Sanity checks:
+#     * SE and SEIR must not allocate more than supply at any time step
 
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ import pulp
 def parse_matrix_from_text(text: str) -> np.ndarray:
     if text.strip() == "":
         raise ValueError("Empty input.")
-    # Try CSV
+    # Try CSV first
     try:
         df = pd.read_csv(io.StringIO(text), header=None)
         arr = df.values.astype(float)
@@ -128,7 +130,7 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
             f"Got min={np.min(row_sums):.6g}, max={np.max(row_sums):.6g}."
         )
 
-    # Guard against prefixes with zero cumulative supply but positive cumulative demand (SE would get inf)
+    # Guard against prefixes with zero cumulative supply but positive cumulative demand
     cumD = np.cumsum(demands.sum(axis=0))
     cumS = np.cumsum(supply)
     if np.any((cumS == 0) & (cumD > 0)):
@@ -143,9 +145,16 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
 
 def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
     """
-    SE (as in your pseudocode).
-    demands: (n,T), supplies: (T,)
-    Returns allocations (n,T) and alpha_values list.
+    Sequential Equalizing (SE) — FIXED.
+
+    Satisfaction alpha should be allocation/demand, so alpha must be <= 1 when supply < demand.
+    Therefore:
+        alpha(t) = cumulative_supply(1..t) / cumulative_demand(1..t)
+    and we pick:
+        t* = argmin_t alpha(t)
+        alpha = alpha(t*)
+    Then allocate w_i(t) = alpha * d_i(t) for t <= t* for "fixed" agents and
+    add alpha*d_i(t) for t > t* progressively (as in your code).
     """
     n, T = demands.shape
     allocations = np.zeros((n, T))
@@ -153,10 +162,17 @@ def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
     N = set(range(n))
     alpha_values = []
 
+    # Cumulative totals across all agents
+    cumD = np.cumsum(np.sum(demands, axis=0))
+    cumS = np.cumsum(supplies)
+
+    # If some prefix has positive demand but zero supply, SE is ill-defined (alpha=0)
+    if np.any((cumS == 0) & (cumD > 0)):
+        raise ValueError("Some prefix has zero cumulative supply but positive cumulative demand.")
+
     while N_star != N:
         Q = [
-            np.sum(demands[:, :t+1]) / np.sum(supplies[:t+1])
-            if np.sum(supplies[:t+1]) > 0 else float('inf')
+            (cumS[t] / cumD[t]) if cumD[t] > 0 else float("inf")
             for t in range(T)
         ]
         t_star = int(np.argmin(Q))
@@ -164,10 +180,12 @@ def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
         alpha_values.append(alpha)
 
         for i in (N - N_star):
+            # allocate for t > t*
             for t in range(t_star + 1, T):
                 allocations[i, t] += alpha * demands[i, t]
 
-            if np.any(demands[i, :t_star+1] > 0):
+            # fix agents with positive demand in prefix
+            if np.any(demands[i, :t_star + 1] > 0):
                 for t in range(t_star + 1):
                     allocations[i, t] = alpha * demands[i, t]
                 N_star.add(i)
@@ -182,17 +200,16 @@ def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
 def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
     """
     SEIR:
-      1) start with DA allocations (paper calls this "minimal IR allocation" via DA),
-      2) compute residual supply and push any negative residual backward,
-      3) run SE on residual, and add.
+      1) start with DA allocations,
+      2) residual supply S_res(t) = S(t) - sum_i w_DA_i(t),
+      3) push negative residual backward,
+      4) run SE on residual and add.
     """
     n, T = demands.shape
     w_da = da_allocations.copy()
 
-    # residual
     S_res = supply - np.sum(w_da, axis=0)
 
-    # push negative residual backward
     for t in range(T - 1, 0, -1):
         if S_res[t] < 0:
             S_res[t - 1] += S_res[t]
@@ -200,7 +217,6 @@ def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
 
     S_res = np.maximum(S_res, 0.0)
 
-    # SE on residual
     w_se, _ = sequential_equalizing(demands, S_res)
     return w_da + w_se
 
@@ -220,11 +236,11 @@ def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: i
     """
     DA:
       - agent gets fixed share S_i(t)=S(t)/n
-      - chooses w_i(t) and forward transfers z_{t,t'} (t < t') to maximize beta_i
+      - chooses w_i(t) and forward transfers z_{t,t'} (t < t') to maximize beta
       - constraints:
-          beta_i * d_i(t) <= w_i(t)
-          S'_i(t) = S_i(t) - sum_{t'>t} z_{t,t'} + sum_{t'<t} z_{t',t}
-          w_i(t) <= S'_i(t)
+          beta * d(t) <= w(t)   (for d(t)>0)
+          Sprime(t) = S(t)/n - outgoing + incoming
+          w(t) <= Sprime(t)
     """
     d = single_agent_d.reshape(-1).astype(float)
     if len(d) != T:
@@ -233,32 +249,27 @@ def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: i
 
     prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
 
-    # Variables
     w = pulp.LpVariable.dicts("w", list(range(T)), lowBound=0)
     Sprime = pulp.LpVariable.dicts("Sprime", list(range(T)), lowBound=0)
     beta = pulp.LpVariable("beta", lowBound=1e-9, upBound=1.0)
 
-    # Only allow forward transfers z_{t,t'} for t < t'
     z = {}
     for t in range(T):
         for tp in range(t + 1, T):
             z[(t, tp)] = pulp.LpVariable(f"z_{t}_{tp}", lowBound=0)
 
-    # Objective
     prob += beta
 
-    # Sprime balance (S_i(t)=S(t)/n)
     for t in range(T):
         incoming = pulp.lpSum(z[(tp, t)] for tp in range(0, t) if (tp, t) in z)
         outgoing = pulp.lpSum(z[(t, tp)] for tp in range(t + 1, T) if (t, tp) in z)
         prob += (Sprime[t] == (S[t] / n) - outgoing + incoming), f"Sprime_balance_{t}"
 
-    # Feasibility and tight allocation constraints
     for t in range(T):
         prob += (w[t] <= Sprime[t]), f"w_le_Sprime_{t}"
-        prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
+        if d[t] > 0:
+            prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
 
-    # Solve
     solver = _pick_solver()
     status = prob.solve(solver)
 
@@ -354,14 +365,27 @@ if run:
         # SE
         alloc_se, _ = sequential_equalizing(demands, supply)
 
+        # Sanity: SE must respect per-time supply
+        if np.any(np.sum(alloc_se, axis=0) > supply + 1e-8):
+            raise RuntimeError("SE infeasible: allocated more than supply at some time step.")
+
         # DA for each agent
         alloc_da = np.zeros_like(demands, dtype=float)
         beta_da = np.zeros(n, dtype=float)
         for i in range(n):
             alloc_da[i, :], beta_da[i], _ = da_optimization_pulp(demands[i:i+1], supply, T, n)
 
+        # Sanity: DA cannot exceed total supply per time step (since sum_i S(t)/n = S(t))
+        if np.any(np.sum(alloc_da, axis=0) > supply + 1e-6):
+            # This should not happen mathematically; if it happens, solver outputs are unreliable.
+            raise RuntimeError("DA infeasible: sum of DA allocations exceeds supply at some time step.")
+
         # SEIR
         alloc_seir = seir(demands, supply, alloc_da)
+
+        # Sanity: SEIR must respect per-time supply
+        if np.any(np.sum(alloc_seir, axis=0) > supply + 1e-6):
+            raise RuntimeError("SEIR infeasible: allocated more than supply at some time step.")
 
         # Per-agent Leontief alphas
         alpha_se = np.array([leontief_alpha(alloc_se[i], demands[i]) for i in range(n)], dtype=float)
@@ -381,8 +405,8 @@ if run:
         summary = pd.DataFrame(
             {
                 "alpha_SE": alpha_se,
-                "beta_DA": beta_da,          # the LP objective value
-                "alpha_DA": alpha_da,        # computed from final DA allocation
+                "beta_DA": beta_da,          # DA LP objective
+                "alpha_DA": alpha_da,        # computed from DA allocation
                 "alpha_SEIR": alpha_seir,
             },
             index=idx,
