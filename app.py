@@ -1,23 +1,17 @@
 # app.py
 # Streamlit UI for:
-#   (1) SE  (Sequential Equalizing — prefix-feasible with storage)
-#   (2) DA  (Decentralized: each agent gets S(t)/n and optimizes local storage to maximize beta)
-#   (3) SEIR/DASE = DA allocations + SE on residual supply after push-back
+#   (1) SE   (Sequential Equalizing — progressive filling on a supply vector, prefix-feasible)
+#   (2) DA   (Decentralized: each agent gets S(t)/n as private stock; chooses consumption plan to maximize beta)
+#   (3) DASE (DA consumption + SE on residual supply after push-back)
 #
 # Run:
 #   pip install streamlit pandas numpy openpyxl pulp
 #   streamlit run app.py
-#
-# Notes:
-# - SE here is implemented in a **prefix-feasible** way (cannot allocate more than cumulative supply).
-# - DA is solved per-agent with PuLP+CBC using an inventory (carry) formulation (no borrowing from future).
-# - Prefix-feasibility is the correct feasibility notion under (central) storage: for each prefix t,
-#     sum_{j<=t} sum_i w_i(j) <= sum_{j<=t} S(j).
 
 from __future__ import annotations
 
 import io
-from typing import Tuple, List, Set
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -54,11 +48,6 @@ def parse_vector_from_text(text: str) -> np.ndarray:
 
 
 def read_excel(file) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Expected formats:
-      Option A: Sheet 'demands' and sheet 'supply'
-      Option B: first sheet demands, second sheet supply
-    """
     xls = pd.ExcelFile(file)
     sheet_names_lower = [s.lower() for s in xls.sheet_names]
 
@@ -127,180 +116,50 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> Tuple[int, int]:
 
 
 # ============================
-# Feasibility check (prefix)
+# Storage feasibility (prefix constraints)
 # ============================
 
 def check_prefix_feasible(alloc: np.ndarray, supply: np.ndarray, name: str):
     used = np.cumsum(np.sum(alloc, axis=0))
     cap = np.cumsum(supply)
-    for t in range(len(supply)):
-        if used[t] > cap[t] + 1e-7:
-            raise ValueError(
-                f"{name} cumulative infeasible at t={t}: used_prefix={used[t]:.6g} > supply_prefix={cap[t]:.6g}."
-            )
-
-
-# ============================
-# Core algorithms
-# ============================
-
-def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray) -> Tuple[np.ndarray, List[float]]:
-    """
-    Sequential Equalizing (SE), implemented to be prefix-feasible with storage.
-
-    This follows the spirit of your pseudocode (iterative, fixing agents once a prefix bottleneck hits),
-    BUT also explicitly updates residual supply so the final allocation cannot exceed cumulative supply.
-
-    At each iteration:
-      - Compute t* = argmin_t  (cumS_res(t) / cumD_active(t))
-      - alpha = that minimum ratio
-      - Allocate alpha*d_i(t) for active agents:
-          * for t <= t*: set w_i(t) = alpha*d_i(t) and FIX agent i (if it has any demand in [0..t*])
-          * for t >  t*: add alpha*d_i(t) (keeps accumulating)
-      - Subtract what was allocated from residual supply, continue.
-
-    Returns:
-      allocations (n,T), alpha_values (one per iteration)
-    """
-    n, T = demands.shape
-    w = np.zeros((n, T), dtype=float)
-
-    S_res = supplies.astype(float).copy()
-    active: Set[int] = set(range(n))
-    alpha_values: List[float] = []
-
-    max_iters = n + T + 10
-    for _ in range(max_iters):
-        if not active:
-            break
-
-        D_active = np.sum(demands[list(active), :], axis=0)
-        cumD = np.cumsum(D_active)
-        cumS = np.cumsum(S_res)
-
-        ratios = []
-        for t in range(T):
-            if cumD[t] <= 1e-12:
-                ratios.append(float("inf"))
-            else:
-                ratios.append(float(cumS[t] / cumD[t]))
-
-        t_star = int(np.argmin(ratios))
-        alpha = float(ratios[t_star])
-        if not np.isfinite(alpha):
-            break
-
-        alpha_values.append(alpha)
-
-        delta = np.zeros((n, T), dtype=float)
-
-        # First, add alpha*d for t > t*
-        if t_star + 1 < T:
-            for i in active:
-                delta[i, t_star + 1 :] = alpha * demands[i, t_star + 1 :]
-
-        # Then, for agents that have demand in the prefix, set prefix allocations and fix them
-        newly_fixed: Set[int] = set()
-        for i in active:
-            if np.any(demands[i, : t_star + 1] > 0):
-                newly_fixed.add(i)
-                delta[i, : t_star + 1] = alpha * demands[i, : t_star + 1]
-
-        w += delta
-        S_res = S_res - np.sum(delta, axis=0)
-
-        if np.min(S_res) < -1e-7:
-            # If this triggers, something is inconsistent numerically.
-            raise ValueError("SE produced negative residual supply (numerical issue).")
-
-        S_res = np.maximum(S_res, 0.0)
-        active -= newly_fixed
-
-    return w, alpha_values
-
-
-def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray) -> np.ndarray:
-    """
-    SEIR / DASE as in your pseudocode:
-
-      1) w_IR := DA
-      2) S'(t) = S(t) - sum_i w_IR_i(t)
-      3) while some S'(t) < 0, take latest negative time t-hat and push it back to t-hat-1
-      4) w* := SE(d, S')
-      5) return w_IR + w*
-
-    Important:
-      - w_IR might use more than S(t) at a particular time t (because agents can store from earlier),
-        but it must satisfy the PREFIX constraint. We validate prefix-feasibility outside.
-    """
-    w_da = da_allocations.copy().astype(float)
-    S_res = supply.astype(float) - np.sum(w_da, axis=0)
-
-    # push negatives backward (latest first)
-    for t in range(len(S_res) - 1, 0, -1):
-        if S_res[t] < 0:
-            S_res[t - 1] += S_res[t]
-            S_res[t] = 0.0
-
-    if S_res[0] < -1e-9:
+    bad = np.where(used > cap + 1e-8)[0]
+    if len(bad) > 0:
+        t = int(bad[0])
         raise ValueError(
-            f"SEIR residual infeasible: S_res[0]={S_res[0]:.6g}<0 after push-back. "
-            "This means DA already used more than total supply in the first prefix (should not happen)."
+            f"{name} is prefix-infeasible at t={t}: "
+            f"used_prefix={used[t]:.6g} > supply_prefix={cap[t]:.6g}."
         )
 
-    S_res = np.maximum(S_res, 0.0)
-    w_se, _ = sequential_equalizing(demands, S_res)
-    return w_da + w_se
-
 
 # ============================
-# DA via PuLP (CBC) using inventory formulation
+# DA: per-agent LP with infinite local storage
 # ============================
 
-def _cbc_solver_or_die():
+def da_single_agent_lp(d_i: np.ndarray, S: np.ndarray, n: int):
     """
-    Streamlit Cloud often does NOT have CBC unless installed.
-    If CBC is missing, we fail with a clear message.
+    DA interpretation (infinite local storage):
+
+    - At each time t, agent i receives Si(t)=S(t)/n into their private stock.
+    - Agent chooses consumption w(t) and remaining stock y(t) (carry to next time).
+    - Objective: maximize beta such that beta*d_i(t) <= w(t) for all t with d_i(t)>0.
+
+    Inventory constraints (no borrowing from the future):
+        w(0) + y(0) <= Si(0)
+        for t>=1: w(t) + y(t) <= Si(t) + y(t-1)
+        w,y >= 0
     """
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    # crude availability check: pulp will error at solve-time if missing; we keep message clear then
-    return solver
-
-
-def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int) -> Tuple[np.ndarray, float, np.ndarray]:
-    """
-    DA with infinite local storage.
-
-    Agent i receives Si(t)=S(t)/n at each time.
-    Agent chooses consumption w(t) and leftover y(t) (carried to next time) to maximize beta:
-
-      w(0) + y(0) <= Si(0)
-      for t>=1: w(t) + y(t) <= Si(t) + y(t-1)
-      beta*d(t) <= w(t)   for d(t)>0
-      w(t), y(t) >= 0
-
-    beta is bounded to avoid "unbounded" issues if some d(t)=0:
-      beta <= sum(Si) / min_{t:d(t)>0} d(t)
-    """
-    d = single_agent_d.reshape(-1).astype(float)
-    if len(d) != T:
-        raise ValueError("single_agent_d has wrong length.")
-    S = S.astype(float)
-    Si = S / float(n)
-
-    d_pos = d[d > 0]
-    if d_pos.size == 0:
-        # should not happen due to validation
-        return np.zeros(T), 0.0, np.zeros(T)
-
-    beta_ub = float(np.sum(Si) / np.min(d_pos))
+    T = len(S)
+    Si = S.astype(float) / float(n)
+    d = d_i.astype(float).reshape(-1)
 
     prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
+
     w = pulp.LpVariable.dicts("w", list(range(T)), lowBound=0)
     y = pulp.LpVariable.dicts("y", list(range(T)), lowBound=0)
-    beta = pulp.LpVariable("beta", lowBound=0.0, upBound=beta_ub)
+    beta = pulp.LpVariable("beta", lowBound=0)
 
     prob += beta
+
     prob += (w[0] + y[0] <= Si[0]), "inv_0"
     for t in range(1, T):
         prob += (w[t] + y[t] <= Si[t] + y[t - 1]), f"inv_{t}"
@@ -309,24 +168,171 @@ def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: i
         if d[t] > 0:
             prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
 
-    solver = _cbc_solver_or_die()
-    try:
-        status = prob.solve(solver)
-    except Exception as e:
-        raise ValueError(
-            "PuLP could not run CBC on this machine. "
-            "If you deploy on Streamlit Cloud, you typically need to install CBC via packages.txt "
-            "(e.g., 'coinor-cbc')."
-        ) from e
-
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    status = prob.solve(solver)
     if pulp.LpStatus[status] != "Optimal":
-        return np.zeros(T), 0.0, np.zeros(T)
+        return np.zeros(T), 0.0
 
     w_arr = np.array([pulp.value(w[t]) for t in range(T)], dtype=float)
-    y_arr = np.array([pulp.value(y[t]) for t in range(T)], dtype=float)
     beta_val = float(pulp.value(beta))
-    return w_arr, beta_val, y_arr
+    return w_arr, beta_val
 
+
+def run_DA(demands: np.ndarray, supply: np.ndarray):
+    n, T = demands.shape
+    alloc_da = np.zeros((n, T), dtype=float)
+    beta_da = np.zeros(n, dtype=float)
+    for i in range(n):
+        alloc_da[i], beta_da[i] = da_single_agent_lp(demands[i], supply, n)
+    # DA is only required to be prefix-feasible globally (which it is, because everyone only uses their own prefix stock)
+    check_prefix_feasible(alloc_da, supply, "DA")
+    return alloc_da, beta_da
+
+
+# ============================
+# SE: progressive filling on a supply vector (matches your multi-iteration example)
+# ============================
+
+def sequential_equalizing_progressive(demands: np.ndarray, supply_vec: np.ndarray):
+    """
+    SE (progressive / multi-iteration), consistent with your worked example:
+
+    Maintain current allocations w and remaining set R=N\\N*.
+    At each iteration:
+      1) compute SURPLUS per time: s_sur(t) = supply_vec(t) - sum_i w_i(t)
+      2) compute cumulative surplus hat{s_sur}(t)
+      3) compute cumulative remaining demand hat{d_R}(t)
+      4) pick t* minimizing Q(t)=hat{s_sur}(t)/hat{d_R}(t) over hat{d_R}(t)>0
+      5) let delta = Q(t*)
+      6) for each i in R: add delta*d_i(t) for all t >= t*
+      7) update each remaining agent's alpha_i += delta
+      8) finalize agents who have any demand in prefix <= t* by setting w_i(t)=alpha_i*d_i(t) for all t<=t*
+         and adding them to N*.
+
+    This uses ONLY surplus that remains after what was already allocated, so it never overspends.
+    Feasibility is guaranteed in prefix sense if supply_vec is prefix-feasible (nonnegative cumulative).
+    """
+    n, T = demands.shape
+    S = supply_vec.astype(float).reshape(-1)
+    w = np.zeros((n, T), dtype=float)
+
+    N_star = set()
+    alpha_i = np.zeros(n, dtype=float)
+
+    def cum(x):
+        return np.cumsum(x)
+
+    for _ in range(n + T + 10):
+        if len(N_star) == n:
+            break
+
+        R = [i for i in range(n) if i not in N_star]
+
+        # Current per-time surplus and cumulative surplus
+        s_sur = S - np.sum(w, axis=0)
+        hat_sur = cum(s_sur)
+
+        # If cumulative surplus goes negative, the supply_vec itself is not prefix-feasible given current w
+        if np.min(hat_sur) < -1e-8:
+            # This should not happen if we compute delta correctly, but guard anyway
+            raise ValueError(
+                "SE internal error: cumulative surplus became negative. "
+                "This indicates inconsistent supply_vec / previous allocations."
+            )
+
+        # Remaining cumulative demand
+        dR_per_t = np.sum(demands[R, :], axis=0)
+        hat_dR = cum(dR_per_t)
+
+        # Compute Q(t)
+        Q = []
+        for t in range(T):
+            if hat_dR[t] <= 1e-12:
+                Q.append(float("inf"))
+            else:
+                Q.append(float(hat_sur[t] / hat_dR[t]))
+
+        t_star = int(np.argmin(Q))
+        if Q[t_star] == float("inf"):
+            # No remaining demand anywhere
+            for i in R:
+                N_star.add(i)
+            continue
+
+        delta = float(Q[t_star])
+        if delta < -1e-12:
+            raise ValueError("SE found a negative delta, which should be impossible under prefix-feasible surplus.")
+
+        # Add delta * demand for remaining agents from t_star..T-1 (1-based t* means include it)
+        for i in R:
+            w[i, t_star:] += delta * demands[i, t_star:]
+            alpha_i[i] += delta
+
+        # Finalize agents that have demand in prefix up to t_star
+        for i in R:
+            if np.any(demands[i, : t_star + 1] > 0):
+                # Ensure prefix exactly matches alpha_i * demand (this is the “fixing” step)
+                w[i, : t_star + 1] = alpha_i[i] * demands[i, : t_star + 1]
+                N_star.add(i)
+
+    # Final feasibility check in prefix sense
+    check_prefix_feasible(w, S, "SE (on given supply vector)")
+    return w
+
+
+# ============================
+# DASE: DA + SE on residual after push-back
+# ============================
+
+def push_back_negatives(S_res: np.ndarray) -> np.ndarray:
+    """
+    Given residual per-time supply that may have negatives, push each negative backward:
+      for t=T-1..1:
+        if S_res[t] < 0:
+           S_res[t-1] += S_res[t]
+           S_res[t] = 0
+    This preserves cumulative residual and ensures nonnegativity per-time (except possibly at t=0, which must be >=0).
+    """
+    S_res = S_res.astype(float).copy()
+    T = len(S_res)
+    for t in range(T - 1, 0, -1):
+        if S_res[t] < 0:
+            S_res[t - 1] += S_res[t]
+            S_res[t] = 0.0
+    if S_res[0] < -1e-9:
+        raise ValueError(f"Residual infeasible even after push-back: S_res[0]={S_res[0]:.6g} < 0.")
+    return np.maximum(S_res, 0.0)
+
+
+def dase(demands: np.ndarray, supply: np.ndarray, da_alloc: np.ndarray):
+    """
+    DASE:
+      w_IR := DA consumption plans
+      S' := S - sum_i w_IR_i
+      push-back negatives in S'
+      w* := SE(d, S')
+      return w_IR + w*
+    """
+    w_ir = da_alloc.astype(float).copy()
+    S = supply.astype(float).reshape(-1)
+
+    # residual (may be negative at some times, but cumulative should be >=0 if w_ir is prefix-feasible)
+    S_res = S - np.sum(w_ir, axis=0)
+
+    # make residual per-time nonnegative by push-back (as in your pseudocode)
+    S_res_pb = push_back_negatives(S_res)
+
+    # run progressive SE on residual surplus
+    w_star = sequential_equalizing_progressive(demands, S_res_pb)
+
+    w_total = w_ir + w_star
+    check_prefix_feasible(w_total, S, "DASE")
+    return w_total, S_res, S_res_pb, w_star
+
+
+# ============================
+# Utility
+# ============================
 
 def leontief_alpha(alloc: np.ndarray, demand: np.ndarray) -> float:
     mask = demand > 0
@@ -334,10 +340,6 @@ def leontief_alpha(alloc: np.ndarray, demand: np.ndarray) -> float:
         return float("inf")
     return float(np.min(alloc[mask] / demand[mask]))
 
-
-# ============================
-# Export helper
-# ============================
 
 def to_excel_bytes(**dfs: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
@@ -352,18 +354,21 @@ def to_excel_bytes(**dfs: pd.DataFrame) -> bytes:
 # Streamlit UI
 # ============================
 
-st.set_page_config(page_title="SE / DA / SEIR (DASE)", layout="wide")
-st.title("SE / DA / SEIR (DASE) — Infinite Storage (PuLP+CBC)")
+st.set_page_config(page_title="SE / DA / DASE (Infinite Storage)", layout="wide")
+st.title("SE / DA / DASE — Infinite Storage (PuLP + Progressive SE)")
 
-with st.sidebar:
-    st.subheader("Demo")
-    if st.button("Load demo (your earlier failing cases)", use_container_width=True):
-        # Demo 1: the 3x3 small one you showed
-        st.session_state["demo_demands"] = "1 2 3\n3 2 1\n2 3 1"
-        st.session_state["demo_supply"] = "1 2 1"
-    if st.button("Load demo (20 20 20 case)", use_container_width=True):
-        st.session_state["demo_demands"] = "7 2 1\n3 0 7\n0 8 2\n4 4 2"
-        st.session_state["demo_supply"] = "20 20 20"
+with st.expander("Built-in example from your paper (click to load)", expanded=False):
+    st.write("This is the example you pasted (n=T=5).")
+    st.code(
+        "Demands:\n"
+        "1 2 1 0 0\n"
+        "3 1 0 0 0\n"
+        "0 2 1 0 1\n"
+        "0 0 2 2 0\n"
+        "0 0 0 3 1\n\n"
+        "Supply:\n"
+        "36 36 36 42 50\n"
+    )
 
 col1, col2 = st.columns(2)
 
@@ -372,15 +377,12 @@ with col1:
     mode = st.radio("Input method", ["Paste", "Excel"], horizontal=True)
 
     if mode == "Paste":
-        d_default = st.session_state.get("demo_demands", "")
-        s_default = st.session_state.get("demo_supply", "")
-        st.caption("Demands: rows=agents, cols=time. Whitespace or commas.")
-        d_text = st.text_area("Demands", height=180, value=d_default)
-        st.caption("Supply: single row/column of length T.")
-        s_text = st.text_area("Supply", height=120, value=s_default)
+        d_text = st.text_area("Demands (rows=agents, cols=time)", height=180,
+                              value="1 2 1 0 0\n3 1 0 0 0\n0 2 1 0 1\n0 0 2 2 0\n0 0 0 3 1")
+        s_text = st.text_area("Supply (single row/column)", height=120,
+                              value="36 36 36 42 50")
         up = None
     else:
-        st.caption("Upload .xlsx with sheets 'demands' and 'supply' (or first=demands, second=supply).")
         up = st.file_uploader("Excel file (.xlsx)", type=["xlsx"])
         d_text = ""
         s_text = ""
@@ -401,89 +403,72 @@ if run:
 
         n, T = validate_inputs(demands, supply)
 
-        total_d = float(np.sum(demands))
-        total_s = float(np.sum(supply))
-        if total_s + 1e-9 < total_d:
-            st.warning(
-                f"Total supply ({total_s:.6g}) is smaller than total demand ({total_d:.6g}). "
-                f"Some alphas will necessarily be < 1."
-            )
-
-        # --- SE
-        alloc_se, se_alpha_list = sequential_equalizing(demands, supply)
+        # --- SE on full supply (sometimes you want to see it)
+        alloc_se = sequential_equalizing_progressive(demands, supply)
         check_prefix_feasible(alloc_se, supply, "SE")
 
-        # --- DA (per-agent LP)
-        alloc_da = np.zeros_like(demands, dtype=float)
-        beta_da = np.zeros(n, dtype=float)
-        for i in range(n):
-            alloc_da[i, :], beta_da[i], _ = da_optimization_pulp(demands[i:i + 1], supply, T, n)
-        check_prefix_feasible(alloc_da, supply, "DA")
+        # --- DA
+        alloc_da, beta_da = run_DA(demands, supply)
 
-        # --- SEIR/DASE
-        alloc_seir = seir(demands, supply, alloc_da)
-        check_prefix_feasible(alloc_seir, supply, "SEIR/DASE")
+        # --- DASE
+        alloc_dase, S_res_raw, S_res_pb, alloc_se_on_res = dase(demands, supply, alloc_da)
 
-        # --- Alphas
+        # --- alphas
         alpha_se = np.array([leontief_alpha(alloc_se[i], demands[i]) for i in range(n)], dtype=float)
         alpha_da = np.array([leontief_alpha(alloc_da[i], demands[i]) for i in range(n)], dtype=float)
-        alpha_seir = np.array([leontief_alpha(alloc_seir[i], demands[i]) for i in range(n)], dtype=float)
+        alpha_dase = np.array([leontief_alpha(alloc_dase[i], demands[i]) for i in range(n)], dtype=float)
 
-        st.success("Computed allocations (prefix-feasible).")
+        idx = [f"agent_{i+1}" for i in range(n)]
+        cols = [f"t{t+1}" for t in range(T)]
 
-        idx = [f"agent_{i}" for i in range(n)]
-        cols = [f"t{t}" for t in range(T)]
         df_dem = pd.DataFrame(demands, index=idx, columns=cols)
-        df_sup = pd.DataFrame(supply.reshape(1, -1), index=["supply"], columns=cols)
+        df_sup = pd.DataFrame(supply.reshape(1, -1), index=["S"], columns=cols)
+
         df_se = pd.DataFrame(alloc_se, index=idx, columns=cols)
         df_da = pd.DataFrame(alloc_da, index=idx, columns=cols)
-        df_seir = pd.DataFrame(alloc_seir, index=idx, columns=cols)
+        df_dase = pd.DataFrame(alloc_dase, index=idx, columns=cols)
 
-        # prefix diagnostics (helps you see feasibility quickly)
-        prefix_used_se = np.cumsum(np.sum(alloc_se, axis=0))
-        prefix_used_da = np.cumsum(np.sum(alloc_da, axis=0))
-        prefix_used_seir = np.cumsum(np.sum(alloc_seir, axis=0))
-        prefix_cap = np.cumsum(supply.astype(float))
-        df_prefix = pd.DataFrame(
-            {
-                "prefix_supply": prefix_cap,
-                "prefix_used_SE": prefix_used_se,
-                "prefix_used_DA": prefix_used_da,
-                "prefix_used_SEIR": prefix_used_seir,
-            },
-            index=cols,
+        df_res = pd.DataFrame(
+            np.vstack([S_res_raw, S_res_pb, np.sum(alloc_se_on_res, axis=0)]),
+            index=["S_res_raw = S - sum(DA)", "S_res_pushback", "sum(SE_on_residual)"],
+            columns=cols
         )
 
         summary = pd.DataFrame(
             {
                 "alpha_SE": alpha_se,
+                "beta_DA": beta_da,
                 "alpha_DA": alpha_da,
-                "beta_DA_LP": beta_da,
-                "alpha_SEIR_DASE": alpha_seir,
-                "SE_alpha_iters": [len(se_alpha_list)] * n,
+                "alpha_DASE": alpha_dase,
             },
             index=idx,
         )
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Summary", "SE", "DA", "SEIR/DASE", "Prefix check"])
+        st.success("Computed allocations (all prefix-feasible).")
+
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Summary", "SE", "DA", "DASE", "Residuals"])
         with tab1:
             st.dataframe(summary, use_container_width=True)
+
         with tab2:
             st.dataframe(df_se, use_container_width=True)
+
         with tab3:
             st.dataframe(df_da, use_container_width=True)
+
         with tab4:
-            st.dataframe(df_seir, use_container_width=True)
+            st.dataframe(df_dase, use_container_width=True)
+
         with tab5:
-            st.dataframe(df_prefix, use_container_width=True)
+            st.dataframe(df_res, use_container_width=True)
 
         out_bytes = to_excel_bytes(
             demands=df_dem,
             supply=df_sup,
             SE=df_se,
             DA=df_da,
-            SEIR_DASE=df_seir,
-            PrefixCheck=df_prefix,
+            DASE=df_dase,
+            Residuals=df_res,
             Summary=summary,
         )
         st.download_button(
