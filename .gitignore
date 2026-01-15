@@ -1,23 +1,45 @@
-# Python
+# .gitignore (Python + Streamlit)
+
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
 
-# Virtualenvs (even if you don't use them)
-venv/
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenvs (you said you don't need one, but ignoring is harmless)
 .venv/
+venv/
+ENV/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / outputs you likely don't want in git
+*.xlsx
+*.csv
+*.pkl
 
 # Streamlit
 .streamlit/secrets.toml
 
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
-
-# Data / outputs
-*.xlsx
-*.csv
-*.log
-*.tmp
+# Misc
+.cache/
