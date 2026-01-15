@@ -1,40 +1,23 @@
-# .gitignore
-
-# Python bytecode / caches
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.so
 
-# Virtual envs (even if you don't use them, safe to ignore)
-.venv/
+# Virtualenvs (even if you don't use them)
 venv/
-env/
+.venv/
 
-# Build / distribution
-build/
-dist/
-*.egg-info/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# VS Code / IDE
-.vscode/
-.idea/
-
-# Streamlit secrets (never commit)
+# Streamlit
 .streamlit/secrets.toml
 
-# Logs and temp files
-*.log
-*.tmp
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
 
-# Output files users might download
+# Data / outputs
 *.xlsx
 *.csv
+*.log
+*.tmp
