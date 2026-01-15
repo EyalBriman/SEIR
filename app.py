@@ -1,7 +1,7 @@
 # app.py
 # Streamlit UI for:
-#   (1) SE  (Sequential Equalizing surplus allocation with storage feasibility via prefixes)
-#   (2) DA  (Decentralized Allocation: each agent gets S(t)/n and optimizes beta with local storage)
+#   (1) SE  (Sequential Equalizing — prefix-feasible with storage)
+#   (2) DA  (Decentralized: each agent gets S(t)/n and optimizes local storage to maximize beta)
 #   (3) SEIR/DASE = DA allocations + SE on residual supply after push-back
 #
 # Run:
@@ -9,12 +9,16 @@
 #   streamlit run app.py
 #
 # Notes:
-# - Uses PuLP + CBC (license-free).
-# - Storage feasibility is checked cumulatively (prefix constraints), consistent with storage/carry.
+# - SE here is implemented in a **prefix-feasible** way (cannot allocate more than cumulative supply).
+# - DA is solved per-agent with PuLP+CBC using an inventory (carry) formulation (no borrowing from future).
+# - Prefix-feasibility is the correct feasibility notion under (central) storage: for each prefix t,
+#     sum_{j<=t} sum_i w_i(j) <= sum_{j<=t} S(j).
 
 from __future__ import annotations
 
 import io
+from typing import Tuple, List, Set
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -26,19 +30,11 @@ import pulp
 # ============================
 
 def parse_matrix_from_text(text: str) -> np.ndarray:
-    """
-    Accepts:
-      - whitespace-separated rows
-      - comma-separated rows
-    We avoid pandas' default CSV parsing because it misreads whitespace-only input.
-    """
     if text.strip() == "":
         raise ValueError("Empty input.")
-
     rows = [r.strip() for r in text.strip().splitlines() if r.strip()]
     data = []
     for r in rows:
-        # allow commas OR whitespace
         r = r.replace(",", " ")
         parts = [p for p in r.split() if p != ""]
         data.append([float(x) for x in parts])
@@ -57,7 +53,7 @@ def parse_vector_from_text(text: str) -> np.ndarray:
     raise ValueError("Supply must be a single row or a single column.")
 
 
-def read_excel(file) -> tuple[np.ndarray, np.ndarray]:
+def read_excel(file) -> Tuple[np.ndarray, np.ndarray]:
     """
     Expected formats:
       Option A: Sheet 'demands' and sheet 'supply'
@@ -101,7 +97,7 @@ def read_excel(file) -> tuple[np.ndarray, np.ndarray]:
     return demands, supply
 
 
-def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
+def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> Tuple[int, int]:
     if demands.ndim != 2:
         raise ValueError("Demands must be a 2D table (agents x time-steps).")
     n, T = demands.shape
@@ -135,10 +131,6 @@ def validate_inputs(demands: np.ndarray, supply: np.ndarray) -> tuple[int, int]:
 # ============================
 
 def check_prefix_feasible(alloc: np.ndarray, supply: np.ndarray, name: str):
-    """
-    Under storage, feasibility is:
-      for all t: sum_{j<=t} sum_i alloc(i,j) <= sum_{j<=t} supply(j)
-    """
     used = np.cumsum(np.sum(alloc, axis=0))
     cap = np.cumsum(supply)
     for t in range(len(supply)):
@@ -152,98 +144,111 @@ def check_prefix_feasible(alloc: np.ndarray, supply: np.ndarray, name: str):
 # Core algorithms
 # ============================
 
-def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray):
+def sequential_equalizing(demands: np.ndarray, supplies: np.ndarray) -> Tuple[np.ndarray, List[float]]:
     """
-    Sequential Equalizing (SE) EXACTLY in the spirit of your pseudocode,
-    but FIXED so it terminates and stays prefix-feasible even when some agents
-    have zero demand in early prefixes.
+    Sequential Equalizing (SE), implemented to be prefix-feasible with storage.
 
-    Key fix:
-      When computing t* and alpha, use ONLY agents in (N \\ N_star).
-      Otherwise agents with zero prefix-demand never become fixable and the
-      loop keeps adding alpha*d forever.
+    This follows the spirit of your pseudocode (iterative, fixing agents once a prefix bottleneck hits),
+    BUT also explicitly updates residual supply so the final allocation cannot exceed cumulative supply.
 
-    t* = argmin_t  hatS(t) / sum_{i in U} hatd_i(t)
-    alpha = that minimum ratio.
+    At each iteration:
+      - Compute t* = argmin_t  (cumS_res(t) / cumD_active(t))
+      - alpha = that minimum ratio
+      - Allocate alpha*d_i(t) for active agents:
+          * for t <= t*: set w_i(t) = alpha*d_i(t) and FIX agent i (if it has any demand in [0..t*])
+          * for t >  t*: add alpha*d_i(t) (keeps accumulating)
+      - Subtract what was allocated from residual supply, continue.
+
+    Returns:
+      allocations (n,T), alpha_values (one per iteration)
     """
     n, T = demands.shape
-    allocations = np.zeros((n, T), dtype=float)
-    N_star: set[int] = set()
-    N: set[int] = set(range(n))
-    alpha_values: list[float] = []
+    w = np.zeros((n, T), dtype=float)
 
-    cumS = np.cumsum(supplies.astype(float))
+    S_res = supplies.astype(float).copy()
+    active: Set[int] = set(range(n))
+    alpha_values: List[float] = []
 
-    # Safety guard against accidental non-progress
     max_iters = n + T + 10
-
     for _ in range(max_iters):
-        if N_star == N:
+        if not active:
             break
 
-        U = sorted(list(N - N_star))  # unfixed agents
-        # cumulative demand of unfixed agents
-        cumD_U = np.cumsum(np.sum(demands[U, :], axis=0))
+        D_active = np.sum(demands[list(active), :], axis=0)
+        cumD = np.cumsum(D_active)
+        cumS = np.cumsum(S_res)
 
-        Q = []
+        ratios = []
         for t in range(T):
-            if cumD_U[t] <= 0:
-                Q.append(float("inf"))
+            if cumD[t] <= 1e-12:
+                ratios.append(float("inf"))
             else:
-                Q.append(float(cumS[t] / cumD_U[t]))
+                ratios.append(float(cumS[t] / cumD[t]))
 
-        t_star = int(np.argmin(Q))
-        alpha = float(Q[t_star])
+        t_star = int(np.argmin(ratios))
+        alpha = float(ratios[t_star])
+        if not np.isfinite(alpha):
+            break
+
         alpha_values.append(alpha)
 
-        # Allocate for all unfixed agents
-        for i in U:
-            # For t > t*: add
-            for t in range(t_star + 1, T):
-                allocations[i, t] += alpha * demands[i, t]
+        delta = np.zeros((n, T), dtype=float)
 
-            # If agent has any positive demand in prefix, fix them and set prefix allocations
-            if np.any(demands[i, :t_star + 1] > 0):
-                for t in range(t_star + 1):
-                    allocations[i, t] = alpha * demands[i, t]
-                N_star.add(i)
+        # First, add alpha*d for t > t*
+        if t_star + 1 < T:
+            for i in active:
+                delta[i, t_star + 1 :] = alpha * demands[i, t_star + 1 :]
 
-    if N_star != N:
-        # If this happens, something degenerate occurred (e.g., supplies all zero after some point).
-        # We fail loudly instead of returning nonsense.
-        raise ValueError("SE did not converge (degenerate input: likely zero residual supply with remaining demand).")
+        # Then, for agents that have demand in the prefix, set prefix allocations and fix them
+        newly_fixed: Set[int] = set()
+        for i in active:
+            if np.any(demands[i, : t_star + 1] > 0):
+                newly_fixed.add(i)
+                delta[i, : t_star + 1] = alpha * demands[i, : t_star + 1]
 
-    return allocations, alpha_values
+        w += delta
+        S_res = S_res - np.sum(delta, axis=0)
+
+        if np.min(S_res) < -1e-7:
+            # If this triggers, something is inconsistent numerically.
+            raise ValueError("SE produced negative residual supply (numerical issue).")
+
+        S_res = np.maximum(S_res, 0.0)
+        active -= newly_fixed
+
+    return w, alpha_values
 
 
-def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
+def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray) -> np.ndarray:
     """
-    SEIR / DASE exactly as you wrote:
+    SEIR / DASE as in your pseudocode:
 
       1) w_IR := DA
       2) S'(t) = S(t) - sum_i w_IR_i(t)
-      3) while some S'(t) < 0: take latest t with negative and push it backward
+      3) while some S'(t) < 0, take latest negative time t-hat and push it back to t-hat-1
       4) w* := SE(d, S')
-      5) w := w_IR + w*
+      5) return w_IR + w*
+
+    Important:
+      - w_IR might use more than S(t) at a particular time t (because agents can store from earlier),
+        but it must satisfy the PREFIX constraint. We validate prefix-feasibility outside.
     """
     w_da = da_allocations.copy().astype(float)
     S_res = supply.astype(float) - np.sum(w_da, axis=0)
 
-    # push negative residual backward
+    # push negatives backward (latest first)
     for t in range(len(S_res) - 1, 0, -1):
         if S_res[t] < 0:
             S_res[t - 1] += S_res[t]
             S_res[t] = 0.0
 
-    # If the very first entry is negative, even storage cannot fix it.
     if S_res[0] < -1e-9:
         raise ValueError(
-            f"SEIR residual infeasible: after push-back, S_res[0]={S_res[0]:.6g}<0. "
-            f"This means DA consumed more than total prefix supply at t=0 (should not happen)."
+            f"SEIR residual infeasible: S_res[0]={S_res[0]:.6g}<0 after push-back. "
+            "This means DA already used more than total supply in the first prefix (should not happen)."
         )
 
     S_res = np.maximum(S_res, 0.0)
-
     w_se, _ = sequential_equalizing(demands, S_res)
     return w_da + w_se
 
@@ -252,49 +257,67 @@ def seir(demands: np.ndarray, supply: np.ndarray, da_allocations: np.ndarray):
 # DA via PuLP (CBC) using inventory formulation
 # ============================
 
-def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int):
+def _cbc_solver_or_die():
+    """
+    Streamlit Cloud often does NOT have CBC unless installed.
+    If CBC is missing, we fail with a clear message.
+    """
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    # crude availability check: pulp will error at solve-time if missing; we keep message clear then
+    return solver
+
+
+def da_optimization_pulp(single_agent_d: np.ndarray, S: np.ndarray, T: int, n: int) -> Tuple[np.ndarray, float, np.ndarray]:
     """
     DA with infinite local storage.
 
-    Each agent i receives Si(t)=S(t)/n at each time t.
-    Agent chooses allocations w(t) and carry y(t) (inventory) to maximize beta:
+    Agent i receives Si(t)=S(t)/n at each time.
+    Agent chooses consumption w(t) and leftover y(t) (carried to next time) to maximize beta:
 
-      maximize beta
-      s.t.
-        w(0) + y(0) <= Si(0)
-        for t>=1: w(t) + y(t) <= Si(t) + y(t-1)
-        beta * d(t) <= w(t)   (for d(t)>0)
-        w(t), y(t) >= 0
+      w(0) + y(0) <= Si(0)
+      for t>=1: w(t) + y(t) <= Si(t) + y(t-1)
+      beta*d(t) <= w(t)   for d(t)>0
+      w(t), y(t) >= 0
 
-    This is equivalent to allowing forward transfers and is numerically cleaner.
+    beta is bounded to avoid "unbounded" issues if some d(t)=0:
+      beta <= sum(Si) / min_{t:d(t)>0} d(t)
     """
     d = single_agent_d.reshape(-1).astype(float)
     if len(d) != T:
         raise ValueError("single_agent_d has wrong length.")
-
     S = S.astype(float)
     Si = S / float(n)
 
-    prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
+    d_pos = d[d > 0]
+    if d_pos.size == 0:
+        # should not happen due to validation
+        return np.zeros(T), 0.0, np.zeros(T)
 
+    beta_ub = float(np.sum(Si) / np.min(d_pos))
+
+    prob = pulp.LpProblem("DA_single_agent", pulp.LpMaximize)
     w = pulp.LpVariable.dicts("w", list(range(T)), lowBound=0)
     y = pulp.LpVariable.dicts("y", list(range(T)), lowBound=0)
-    beta = pulp.LpVariable("beta", lowBound=0.0, upBound=None)  # do not cap at 1
+    beta = pulp.LpVariable("beta", lowBound=0.0, upBound=beta_ub)
 
     prob += beta
-
-    # inventory constraints
     prob += (w[0] + y[0] <= Si[0]), "inv_0"
     for t in range(1, T):
         prob += (w[t] + y[t] <= Si[t] + y[t - 1]), f"inv_{t}"
 
-    # satisfaction constraints
     for t in range(T):
         if d[t] > 0:
             prob += (beta * d[t] <= w[t]), f"beta_demand_{t}"
 
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    status = prob.solve(solver)
+    solver = _cbc_solver_or_die()
+    try:
+        status = prob.solve(solver)
+    except Exception as e:
+        raise ValueError(
+            "PuLP could not run CBC on this machine. "
+            "If you deploy on Streamlit Cloud, you typically need to install CBC via packages.txt "
+            "(e.g., 'coinor-cbc')."
+        ) from e
 
     if pulp.LpStatus[status] != "Optimal":
         return np.zeros(T), 0.0, np.zeros(T)
@@ -329,20 +352,18 @@ def to_excel_bytes(**dfs: pd.DataFrame) -> bytes:
 # Streamlit UI
 # ============================
 
-st.set_page_config(page_title="SE / SEIR / DA Allocator", layout="wide")
-st.title("SE / SEIR (DASE) / DA — Infinite Storage (license-free)")
+st.set_page_config(page_title="SE / DA / SEIR (DASE)", layout="wide")
+st.title("SE / DA / SEIR (DASE) — Infinite Storage (PuLP+CBC)")
 
-with st.expander("Input format (quick)", expanded=False):
-    st.write(
-        """
-- **Demands**: matrix (agents × time steps). Rows=agents, cols=time.
-- **Supply**: vector of length T (single row or single column).
-- Checks:
-  - all numbers **>= 0**
-  - all demand rows have the **same total sum**
-  - cumulative feasibility (prefix) is used for storage
-        """
-    )
+with st.sidebar:
+    st.subheader("Demo")
+    if st.button("Load demo (your earlier failing cases)", use_container_width=True):
+        # Demo 1: the 3x3 small one you showed
+        st.session_state["demo_demands"] = "1 2 3\n3 2 1\n2 3 1"
+        st.session_state["demo_supply"] = "1 2 1"
+    if st.button("Load demo (20 20 20 case)", use_container_width=True):
+        st.session_state["demo_demands"] = "7 2 1\n3 0 7\n0 8 2\n4 4 2"
+        st.session_state["demo_supply"] = "20 20 20"
 
 col1, col2 = st.columns(2)
 
@@ -351,10 +372,12 @@ with col1:
     mode = st.radio("Input method", ["Paste", "Excel"], horizontal=True)
 
     if mode == "Paste":
-        st.caption("Paste demands: whitespace or commas. Example row: `7 2 1`")
-        d_text = st.text_area("Demands", height=180)
-        st.caption("Paste supply as one row/column, length T. Example: `20 20 20`")
-        s_text = st.text_area("Supply", height=120)
+        d_default = st.session_state.get("demo_demands", "")
+        s_default = st.session_state.get("demo_supply", "")
+        st.caption("Demands: rows=agents, cols=time. Whitespace or commas.")
+        d_text = st.text_area("Demands", height=180, value=d_default)
+        st.caption("Supply: single row/column of length T.")
+        s_text = st.text_area("Supply", height=120, value=s_default)
         up = None
     else:
         st.caption("Upload .xlsx with sheets 'demands' and 'supply' (or first=demands, second=supply).")
@@ -368,7 +391,6 @@ with col2:
 
 if run:
     try:
-        # Parse
         if mode == "Paste":
             demands = parse_matrix_from_text(d_text)
             supply = parse_vector_from_text(s_text)
@@ -379,27 +401,35 @@ if run:
 
         n, T = validate_inputs(demands, supply)
 
-        # SE
-        alloc_se, _ = sequential_equalizing(demands, supply)
+        total_d = float(np.sum(demands))
+        total_s = float(np.sum(supply))
+        if total_s + 1e-9 < total_d:
+            st.warning(
+                f"Total supply ({total_s:.6g}) is smaller than total demand ({total_d:.6g}). "
+                f"Some alphas will necessarily be < 1."
+            )
+
+        # --- SE
+        alloc_se, se_alpha_list = sequential_equalizing(demands, supply)
         check_prefix_feasible(alloc_se, supply, "SE")
 
-        # DA
+        # --- DA (per-agent LP)
         alloc_da = np.zeros_like(demands, dtype=float)
         beta_da = np.zeros(n, dtype=float)
         for i in range(n):
-            alloc_da[i, :], beta_da[i], _ = da_optimization_pulp(demands[i:i+1], supply, T, n)
+            alloc_da[i, :], beta_da[i], _ = da_optimization_pulp(demands[i:i + 1], supply, T, n)
         check_prefix_feasible(alloc_da, supply, "DA")
 
-        # SEIR/DASE
+        # --- SEIR/DASE
         alloc_seir = seir(demands, supply, alloc_da)
         check_prefix_feasible(alloc_seir, supply, "SEIR/DASE")
 
-        # Alphas
+        # --- Alphas
         alpha_se = np.array([leontief_alpha(alloc_se[i], demands[i]) for i in range(n)], dtype=float)
         alpha_da = np.array([leontief_alpha(alloc_da[i], demands[i]) for i in range(n)], dtype=float)
         alpha_seir = np.array([leontief_alpha(alloc_seir[i], demands[i]) for i in range(n)], dtype=float)
 
-        st.success("Computed allocations.")
+        st.success("Computed allocations (prefix-feasible).")
 
         idx = [f"agent_{i}" for i in range(n)]
         cols = [f"t{t}" for t in range(T)]
@@ -409,31 +439,43 @@ if run:
         df_da = pd.DataFrame(alloc_da, index=idx, columns=cols)
         df_seir = pd.DataFrame(alloc_seir, index=idx, columns=cols)
 
+        # prefix diagnostics (helps you see feasibility quickly)
+        prefix_used_se = np.cumsum(np.sum(alloc_se, axis=0))
+        prefix_used_da = np.cumsum(np.sum(alloc_da, axis=0))
+        prefix_used_seir = np.cumsum(np.sum(alloc_seir, axis=0))
+        prefix_cap = np.cumsum(supply.astype(float))
+        df_prefix = pd.DataFrame(
+            {
+                "prefix_supply": prefix_cap,
+                "prefix_used_SE": prefix_used_se,
+                "prefix_used_DA": prefix_used_da,
+                "prefix_used_SEIR": prefix_used_seir,
+            },
+            index=cols,
+        )
+
         summary = pd.DataFrame(
             {
                 "alpha_SE": alpha_se,
-                "beta_DA": beta_da,
                 "alpha_DA": alpha_da,
+                "beta_DA_LP": beta_da,
                 "alpha_SEIR_DASE": alpha_seir,
+                "SE_alpha_iters": [len(se_alpha_list)] * n,
             },
             index=idx,
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Summary", "SE", "DA", "SEIR/DASE"])
-
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Summary", "SE", "DA", "SEIR/DASE", "Prefix check"])
         with tab1:
-            st.write("**Sizes**", {"n": n, "T": T})
-            st.write("**Demand row sum:**", float(df_dem.sum(axis=1).iloc[0]))
             st.dataframe(summary, use_container_width=True)
-
         with tab2:
             st.dataframe(df_se, use_container_width=True)
-
         with tab3:
             st.dataframe(df_da, use_container_width=True)
-
         with tab4:
             st.dataframe(df_seir, use_container_width=True)
+        with tab5:
+            st.dataframe(df_prefix, use_container_width=True)
 
         out_bytes = to_excel_bytes(
             demands=df_dem,
@@ -441,6 +483,7 @@ if run:
             SE=df_se,
             DA=df_da,
             SEIR_DASE=df_seir,
+            PrefixCheck=df_prefix,
             Summary=summary,
         )
         st.download_button(
