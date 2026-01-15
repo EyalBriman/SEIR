@@ -215,7 +215,6 @@ if st.button("Compute allocations", type="primary"):
         with tab2:
             st.dataframe(pd.DataFrame(w_DA, index=idx, columns=cols))
             st.write("Alphas:", alpha_DA)
-            st.write("Betas (LP):", beta_DA.tolist())
 
         with tab3:
             st.dataframe(pd.DataFrame(w_DASE, index=idx, columns=cols))
@@ -223,3 +222,4 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
