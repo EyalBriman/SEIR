@@ -110,32 +110,47 @@ def DA(demands: np.ndarray, S: np.ndarray):
 # SE (progressive filling, EXACT)
 # ============================
 
-def SE(demands: np.ndarray, S: np.ndarray):
+def SE(demands: np.ndarray, S: np.ndarray) -> np.ndarray:
+    """
+    Sequential Equalizing (SE) / progressive filling with forward-only storage.
+    Feasibility is by prefix constraints:
+        for all t:  sum_{tau<=t} sum_i w_i(tau) <= sum_{tau<=t} S(tau)
+    """
     n, T = demands.shape
-    w = np.zeros((n, T))
+    w = np.zeros((n, T), dtype=float)
 
-    N = set(range(n))
-    N_star = set()
+    active = set(range(n))  # agents not yet finalized
+    p = 0                   # first (0-based) time index that is NOT saturated yet
 
-    while N_star != N:
-        # cumulative ratios
-        ratios = []
-        for t in range(T):
-            Dhat = sum(demands[i, :t+1].sum() for i in N - N_star)
-            Shat = sum(S[:t+1])
-            ratios.append(np.inf if Dhat == 0 else Shat / Dhat)
+    while active and p < T:
+        cumS = np.cumsum(S)
+        cumAlloc = np.cumsum(w.sum(axis=0))
+        slack = cumS - cumAlloc  # remaining prefix slack
+
+        ratios = [math.inf] * T
+        for t in range(p, T):
+            denom = 0.0
+            for i in active:
+                denom += demands[i, p:t+1].sum()  # only demand after current frontier p
+            if denom > 0:
+                ratios[t] = slack[t] / denom
 
         t_star = int(np.argmin(ratios))
-        alpha = ratios[t_star]
+        Delta = ratios[t_star]
+        if not np.isfinite(Delta):
+            break
 
-        for i in N - N_star:
-            for t in range(t_star + 1, T):
-                w[i, t] += alpha * demands[i, t]
+        # Increase allocations proportionally from time p onward
+        for i in active:
+            w[i, p:] += Delta * demands[i, p:]
 
-            if np.any(demands[i, :t_star + 1] > 0):
-                for t in range(t_star + 1):
-                    w[i, t] = alpha * demands[i, t]
-                N_star.add(i)
+        # The bottleneck prefix up to t_star is now saturated; move frontier
+        p = t_star + 1
+
+        # Any agent with positive demand in the saturated prefix becomes final
+        to_remove = [i for i in active if np.any(demands[i, :p] > 0)]
+        for i in to_remove:
+            active.remove(i)
 
     return w
 
@@ -144,22 +159,58 @@ def SE(demands: np.ndarray, S: np.ndarray):
 # DASE / SEIR
 # ============================
 
-def DASE(demands: np.ndarray, S: np.ndarray, w_DA: np.ndarray):
-    S_res = S - w_DA.sum(axis=0)
-
-    for t in range(len(S_res) - 1, 0, -1):
-        if S_res[t] < 0:
-            S_res[t - 1] += S_res[t]
-            S_res[t] = 0.0
-
+def residualize_supply_forward_only(S_res: np.ndarray) -> np.ndarray:
+    """
+    Enforce forward-only storage feasibility for residual supply:
+    all prefix sums must be nonnegative.
+    We can carry surplus forward, but cannot borrow from the future.
+    """
+    S_res = S_res.astype(float).copy()
+    running = 0.0
+    for t in range(len(S_res)):
+        running += S_res[t]
+        if running < -1e-12:
+            raise ValueError(
+                "DA allocation violates prefix feasibility (borrows from the future). "
+                "Cannot form a valid residual supply for forward-only storage."
+            )
+        # keep as-is; SE uses prefix sums anyway
+    # You may still want to clamp tiny negatives due to numerical noise:
     S_res = np.maximum(S_res, 0.0)
-    w_SE = SE(demands, S_res)
-    return w_DA + w_SE
+    return S_res
 
 
-def alpha_from_alloc(w: np.ndarray, d: np.ndarray):
+def DASE(demands: np.ndarray, S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
+    """
+    DASE = DA (IR part) + SE run on the residual instance:
+      - residual supply: S_res(t) = S(t) - sum_i w_DA(i,t)
+      - residual demands: d_res(i,t) = max(d(i,t) - w_DA(i,t), 0)
+    Then return w_DA + w_SE_res.
+    """
+    # 1) residual supply per time step
+    S_res = S - w_DA.sum(axis=0)
+    S_res = residualize_supply_forward_only(S_res)
+
+    # 2) residual demands per agent/time (what is still missing)
+    d_res = np.maximum(demands - w_DA, 0.0)
+
+    # 3) run SE on the residual instance
+    w_SE_res = SE(d_res, S_res)
+
+    # 4) combine
+    return w_DA + w_SE_res
+
+
+def alpha_from_alloc(w: np.ndarray, d: np.ndarray) -> float:
+    """
+    Leontief-style alpha: min_{t: d(t)>0} w(t)/d(t).
+    If an agent has no positive demands (shouldn't happen in your validation), return +inf.
+    """
     mask = d > 0
-    return np.min(w[mask] / d[mask])
+    if not np.any(mask):
+        return float("inf")
+    return float(np.min(w[mask] / d[mask]))
+
 
 
 # ============================
@@ -222,4 +273,5 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
 
