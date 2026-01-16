@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import pulp
+import math  
 
 
 # ============================
@@ -273,5 +274,6 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
 
 
