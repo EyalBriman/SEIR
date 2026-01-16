@@ -231,7 +231,7 @@ Insert your instance below.
 
 dem_text = st.text_area(
     "Demands",
-    placeholder="e.g.\n1 2 1 0\n3 1 0 0\n0 2 1 0",
+    placeholder="e.g.\n1 2 1 0\n3 1 0 0\n0 2 2 0",
     height=180,
 )
 
@@ -274,6 +274,7 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
 
 
 
