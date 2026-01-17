@@ -192,13 +192,10 @@ def DASE(demands: np.ndarray, S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
     S_res = S - w_DA.sum(axis=0)
     S_res = residualize_supply_forward_only(S_res)
 
-    # 2) residual demands per agent/time (what is still missing)
-    d_res = np.maximum(demands - w_DA, 0.0)
+    # 2) run SE on the residual instance
+    w_SE_res = SE(demands, S_res)
 
-    # 3) run SE on the residual instance
-    w_SE_res = SE(d_res, S_res)
-
-    # 4) combine
+    # 3) combine
     return w_DA + w_SE_res
 
 
@@ -274,6 +271,7 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
 
 
 
