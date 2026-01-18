@@ -111,47 +111,67 @@ def DA(demands: np.ndarray, S: np.ndarray):
 # SE (progressive filling, EXACT)
 # ============================
 
-def SE(demands: np.ndarray, S: np.ndarray) -> np.ndarray:
+
+def SE(demands: np.ndarray, S_step: np.ndarray) -> np.ndarray:
     """
-    Sequential Equalizing (SE) / progressive filling with forward-only storage.
-    Feasibility is by prefix constraints:
-        for all t:  sum_{tau<=t} sum_i w_i(tau) <= sum_{tau<=t} S(tau)
+    SE / progressive filling with forward-only storage.
+    Accepts per-step S_step that may contain negatives, as long as all prefixes
+    cumS(t)=sum_{<=t} S_step are nonnegative.
+
+    This implements the 'frontier p' version:
+      - pick bottleneck t* using segment slack from p..t
+      - allocate Delta * demands on t>=p
+      - advance p = t*+1
+      - finalize agents with any demand in the saturated prefix
     """
     n, T = demands.shape
     w = np.zeros((n, T), dtype=float)
 
-    active = set(range(n))  # agents not yet finalized
-    p = 0                   # first (0-based) time index that is NOT saturated yet
+    cumS = np.cumsum(S_step).astype(float)
+    if cumS.min() < -1e-9:
+        raise ValueError("Prefix-infeasible supply for forward-only storage (negative prefix).")
+
+    active = set(range(n))
+    p = 0  # first unsaturated time index
 
     while active and p < T:
-        cumS = np.cumsum(S)
         cumAlloc = np.cumsum(w.sum(axis=0))
-        slack = cumS - cumAlloc  # remaining prefix slack
+        slack = cumS - cumAlloc  # remaining prefix slack for [0..t]
 
-        ratios = [math.inf] * T
+        base = 0.0 if p == 0 else slack[p-1]  # slack already 'committed' up to p-1
+
+        best_t = None
+        best_ratio = math.inf
+
         for t in range(p, T):
-            denom = 0.0
-            for i in active:
-                denom += demands[i, p:t+1].sum()  # only demand after current frontier p
-            if denom > 0:
-                ratios[t] = slack[t] / denom
+            denom = sum(demands[i, p:t+1].sum() for i in active)
+            if denom <= 0:
+                continue
 
-        t_star = int(np.argmin(ratios))
-        Delta = ratios[t_star]
-        if not np.isfinite(Delta):
+            seg_slack = slack[t] - base  # slack available for the segment [p..t]
+            if seg_slack < -1e-12:
+                # segment already infeasible; skip (shouldn't happen if code is consistent)
+                continue
+
+            ratio = seg_slack / denom
+            if ratio < best_ratio:
+                best_ratio = ratio
+                best_t = t
+
+        if best_t is None:
             break
 
-        # Increase allocations proportionally from time p onward
+        Delta = best_ratio
+
+        # allocate only on the unsaturated suffix
         for i in active:
             w[i, p:] += Delta * demands[i, p:]
 
-        # The bottleneck prefix up to t_star is now saturated; move frontier
-        p = t_star + 1
+        # segment [p..best_t] becomes tight; move frontier
+        p = best_t + 1
 
-        # Any agent with positive demand in the saturated prefix becomes final
-        to_remove = [i for i in active if np.any(demands[i, :p] > 0)]
-        for i in to_remove:
-            active.remove(i)
+        # finalize agents with any demand in the saturated prefix
+        active = {i for i in active if not np.any(demands[i, :p] > 0)}
 
     return w
 
@@ -276,6 +296,7 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
 
 
 
