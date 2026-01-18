@@ -160,43 +160,48 @@ def SE(demands: np.ndarray, S: np.ndarray) -> np.ndarray:
 # DASE / SEIR
 # ============================
 
-def residualize_supply_forward_only(S_res: np.ndarray) -> np.ndarray:
+
+def residual_prefix_budget(S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
     """
-    Enforce forward-only storage feasibility for residual supply:
-    all prefix sums must be nonnegative.
-    We can carry surplus forward, but cannot borrow from the future.
+    Returns residual prefix budget Shat_rem(t) after DA:
+        Shat_rem(t) = sum_{<=t} S - sum_{<=t} sum_i w_DA
+    Must be >=0 for all t under forward-only storage.
     """
-    S_res = S_res.astype(float).copy()
-    running = 0.0
-    for t in range(len(S_res)):
-        running += S_res[t]
-        if running < -1e-12:
-            raise ValueError(
-                "DA allocation violates prefix feasibility (borrows from the future). "
-                "Cannot form a valid residual supply for forward-only storage."
-            )
-        # keep as-is; SE uses prefix sums anyway
-    # You may still want to clamp tiny negatives due to numerical noise:
-    S_res = np.maximum(S_res, 0.0)
-    return S_res
+    S = S.astype(float)
+    A = w_DA.sum(axis=0).astype(float)
+    Shat_rem = np.cumsum(S) - np.cumsum(A)
+
+    if Shat_rem.min() < -1e-9:
+        t_bad = int(np.argmin(Shat_rem))
+        raise ValueError(
+            f"DA allocation is prefix-infeasible (borrows from the future) at t={t_bad}: "
+            f"residual_prefix={Shat_rem[t_bad]:.6g}."
+        )
+    return Shat_rem
+
+
+def prefix_budget_to_step_supply(Shat: np.ndarray) -> np.ndarray:
+    """
+    Convert a prefix budget Shat(t) into a per-step vector S_step with the same prefixes.
+    This S_step may have negative entries; that is OK (prefixes remain nonnegative).
+    """
+    Shat = Shat.astype(float)
+    S_step = np.empty_like(Shat)
+    S_step[0] = Shat[0]
+    S_step[1:] = Shat[1:] - Shat[:-1]
+    return S_step
 
 
 def DASE(demands: np.ndarray, S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
     """
-    DASE = DA (IR part) + SE run on the residual instance:
-      - residual supply: S_res(t) = S(t) - sum_i w_DA(i,t)
-      - residual demands: d_res(i,t) = max(d(i,t) - w_DA(i,t), 0)
-    Then return w_DA + w_SE_res.
+    DASE = w_DA + SE(d, S_rem), where S_rem represents the residual prefix budget after DA.
+    IMPORTANT: SE sees the ORIGINAL demands (not residual demands).
     """
-    # 1) residual supply per time step
-    S_res = S - w_DA.sum(axis=0)
-    S_res = residualize_supply_forward_only(S_res)
+    Shat_rem = residual_prefix_budget(S, w_DA)
+    S_rem = prefix_budget_to_step_supply(Shat_rem)
+    w_SE = SE(demands, S_rem)
+    return w_DA + w_SE
 
-    # 2) run SE on the residual instance
-    w_SE_res = SE(demands, S_res)
-
-    # 3) combine
-    return w_DA + w_SE_res
 
 
 def alpha_from_alloc(w: np.ndarray, d: np.ndarray) -> float:
@@ -271,6 +276,7 @@ if st.button("Compute allocations", type="primary"):
 
     except Exception as e:
         st.error(str(e))
+
 
 
 
